@@ -182,3 +182,10 @@ ocr review --background "$(cat rules/severity-instruction.md)" --format json
   **blocks** a request, the action posts the reason as a PR comment and fails the
   check closed (the diff was never sent to the model). Dependency CVE / SBOM
   scanning is not bundled; wire it in as an external guardrail Connection (step 2).
+
+## License
+
+[MIT](./LICENSE) © Continuum-AI-Corp.
+
+The review engine is [Open Code Review](https://github.com/alibaba/open-code-review)
+(Apache-2.0); its license and attribution are preserved in [`NOTICE`](./NOTICE).
