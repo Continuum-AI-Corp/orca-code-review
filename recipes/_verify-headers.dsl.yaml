@@ -1,0 +1,22 @@
+# STEP-2 VERIFICATION ONLY — do not use for real reviews.
+#
+# Purpose: confirm the gateway surfaces arbitrary Action-injected `x-cr-*`
+# headers into the routing-DSL `headers[...]` CEL env. This is the linchpin of
+# the whole design (the proxy shim stamps facts as headers; the DSL routes on
+# them). If this recipe routes to the "strong" model only when the header is
+# present, headers reach the DSL and we can proceed with the real recipe.
+#
+# How to test: set OCR_LLM_URL through the proxy shim so it stamps
+#   x-cr-prev-tier: strong
+# then run one review and confirm GLM (not DeepSeek) answered. Flip the header
+# to `cheap`/absent and confirm DeepSeek answers.
+
+version: 1
+
+rules:
+  - id: header-probe
+    when: 'headers["x-cr-prev-tier"] == "strong"'
+    use: { model: "z-ai/glm-5.2" }   # for testing, temporarily swap to z-ai/glm-5.1
+
+default:
+  model: "deepseek/deepseek-v4-pro"

@@ -1,0 +1,34 @@
+# OrcaRouter Code Review — model-selection policy (the real recipe).
+#
+# Paste this into the per-workspace router `orcarouter/code-review`
+# (Dashboard → Routers → code-review → DSL). The Action never names a model; it
+# only injects raw facts as headers and this recipe decides cheap vs strong.
+#
+# Facts injected by the Action (via the in-job proxy shim):
+#   x-cr-prev-tier : none | cheap | strong   (tier used on the previous pass)
+#   x-cr-prev-p0p1 : true | false            (did the previous pass find a P0/P1)
+#
+# Policy (first match wins):
+#   1. promoted    — once the PR reached strong, it stays strong forever
+#                    (strong-found P0/P1 blocks the merge but never demotes).
+#   2. holding     — cheap tier still has P0/P1 outstanding → keep looping cheap.
+#   3. escalate    — cheap tier came back clean → promote to the strong final pass.
+#   default        — fresh PR / no prior state → start on cheap.
+
+version: 1
+
+rules:
+  - id: promoted
+    when: 'headers["x-cr-prev-tier"] == "strong"'
+    use: { model: "z-ai/glm-5.2" }
+
+  - id: holding
+    when: 'headers["x-cr-prev-tier"] == "cheap" && headers["x-cr-prev-p0p1"] == "true"'
+    use: { model: "deepseek/deepseek-v4-pro" }
+
+  - id: escalate
+    when: 'headers["x-cr-prev-tier"] == "cheap" && headers["x-cr-prev-p0p1"] == "false"'
+    use: { model: "z-ai/glm-5.2" }
+
+default:
+  model: "deepseek/deepseek-v4-pro"

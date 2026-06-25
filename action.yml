@@ -1,0 +1,496 @@
+# OrcaRouter Code Review — reusable composite action.
+#
+# Consumers reference this with `uses:` instead of copying the folder; see
+# workflows/orcarouter-code-review.yml for the ~15-line example workflow.
+#
+# Stateful cost-tiered cascade: each PR stores its current tier as an
+# `orca-review:strong` label. A PR with no label runs the cheap tier first; if
+# that pass is clear of `fix-first` (P0/P1) it escalates to the strong tier in
+# the SAME run — so the strong tier always reviews before merge — and records a
+# permanent promotion so later pushes go straight to the strong tier. While the
+# cheap tier still finds `fix-first`, the strong tier is withheld (fix those
+# first — no point paying for it while obvious bugs remain). Findings post as
+# inline PR comments and a severity gate can fail the check to block the merge.
+#
+# Model selection is NOT hardcoded here. The action only DECIDES the tier and
+# emits it as raw facts (x-cr-prev-tier / x-cr-prev-p0p1). OCR can't send custom
+# headers, so an in-job loopback proxy (scripts/fact-proxy.mjs) stamps those
+# facts onto OCR's requests; the workspace router's DSL recipe
+# (recipes/code-review.dsl.yaml) maps them to the concrete cheap/strong model.
+
+name: "OrcaRouter Code Review"
+description: "AI PR review via the OrcaRouter gateway — cost-tiered cascade with a severity merge gate."
+author: "OrcaRouter"
+
+branding:
+  icon: "git-pull-request"
+  color: "blue"
+
+inputs:
+  orcarouter-api-key:
+    description: "OrcaRouter API key."
+    required: true
+  orcarouter-url:
+    description: "OrcaRouter chat-completions endpoint."
+    required: false
+    default: "https://api.orcarouter.ai/v1/chat/completions"
+  github-token:
+    description: "Token used to fetch the PR head, post review comments, and manage the tier label."
+    required: false
+    default: ${{ github.token }}
+  brand:
+    description: "Name shown on PR comments."
+    required: false
+    default: "OrcaRouter Code Review"
+  router:
+    description: >-
+      OrcaRouter router alias (orcarouter/<name>) that owns model selection.
+      The action names no models: it injects the cascade's raw facts
+      (x-cr-prev-tier / x-cr-prev-p0p1) as headers and this router's DSL recipe
+      maps them to the cheap/strong model. See recipes/code-review.dsl.yaml.
+    required: false
+    default: "orcarouter/code-review"
+  fix-first:
+    description: "Severities that withhold the strong tier until fixed at the cheap tier."
+    required: false
+    default: "P0,P1"
+  block-on:
+    description: "Severities that fail the check (block the merge)."
+    required: false
+    default: "P0,P1"
+  engine-version:
+    description: "Pinned @alibaba-group/open-code-review version (the review engine). Bump deliberately after testing — the later steps parse its JSON output shape."
+    required: false
+    default: "1.3.13"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve PR refs
+      id: pr
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          let base, headSha, num;
+          if (context.eventName === 'pull_request_target') {
+            base = context.payload.pull_request.base.ref;
+            headSha = context.payload.pull_request.head.sha;
+            num = context.payload.pull_request.number;
+          } else {
+            num = context.issue.number;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo, pull_number: num,
+            });
+            base = pr.base.ref; headSha = pr.head.sha;
+          }
+          core.setOutput('base', base);
+          core.setOutput('head_sha', headSha);
+          core.setOutput('number', String(num));
+
+          // Stateful tier: the PR carries an `orca-review:strong` label once it
+          // has been promoted to the strong model. No label means it is still on
+          // the cheap tier. One run uses exactly ONE model.
+          const labels = await github.paginate(
+            github.rest.issues.listLabelsOnIssue,
+            { owner: context.repo.owner, repo: context.repo.repo, issue_number: num, per_page: 100 },
+          );
+          const promoted = labels.some((l) => l.name === 'orca-review:strong');
+          core.setOutput('tier', promoted ? '1' : '0');
+          core.info(`PR #${num} review tier: ${promoted ? '1 (strong)' : '0 (cheap)'}`);
+
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # full history for the merge-base diff
+        ref: ${{ steps.pr.outputs.head_sha }}
+        # Don't leave the job token in .git/config: on pull_request_target later
+        # steps (incl. the OCR agent reading untrusted PR files) run with secrets,
+        # so a prompt-injected file must not be able to read a persisted token.
+        persist-credentials: false
+
+    - name: Fetch PR head (covers fork PRs)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+      run: |
+        # Authenticate this one fetch with a command-scoped header (works for
+        # private repos) so the token is never written to disk for later steps.
+        AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+        git -c "http.extraheader=Authorization: Basic $AUTH" \
+          fetch origin "pull/${PR_NUMBER}/head"
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install review engine
+      shell: bash
+      env:
+        ENGINE_VERSION: ${{ inputs.engine-version }}
+      run: npm install -g "@alibaba-group/open-code-review@${ENGINE_VERSION}"
+
+    - name: Review (stateful cost-tiered cascade)
+      id: cascade
+      shell: bash
+      env:
+        TIER_STATE: ${{ steps.pr.outputs.tier }}
+        ROUTER: ${{ inputs.router }}
+        FIX_FIRST: ${{ inputs.fix-first }}
+        BASE: origin/${{ steps.pr.outputs.base }}
+        HEAD: ${{ steps.pr.outputs.head_sha }}
+        INSTRUCTION: ${{ github.action_path }}/rules/severity-instruction.md
+        GATE: ${{ github.action_path }}/scripts/gate.mjs
+        CHECK: ${{ github.action_path }}/scripts/check-result.mjs
+        PROXY: ${{ github.action_path }}/scripts/fact-proxy.mjs
+        BRAND: ${{ inputs.brand }}
+        # The real OrcaRouter endpoint. OCR does NOT talk to it directly: the
+        # in-job proxy stamps the cascade's facts as headers and forwards here.
+        ORCAROUTER_URL: ${{ inputs.orcarouter-url }}
+        # Drive OCR entirely through env vars — its highest-priority config source.
+        # Nothing is written to the shared ~/.opencodereview, so we neither leak a
+        # token to disk nor clobber a self-hosted runner's existing OCR config.
+        # The model is the router alias; the router's DSL picks the real model.
+        OCR_LLM_TOKEN: ${{ inputs.orcarouter-api-key }}
+        OCR_LLM_AUTH_HEADER: authorization
+        OCR_LLM_MODEL: ${{ inputs.router }}
+        OCR_USE_ANTHROPIC: "false"
+        # Pin the engine: a background auto-update would defeat engine-version and
+        # could change the JSON shape the later steps parse.
+        OCR_NO_UPDATE: "1"
+        # Write engine output OUTSIDE the PR checkout. A fork could commit
+        # `result.json`/`review.log` as symlinks pointing at e.g. ~/.ssh; a `>`
+        # redirect in the working tree would follow them and clobber the target.
+        # $RUNNER_TEMP is runner-controlled and reset per job.
+        RESULT: ${{ runner.temp }}/result.json
+        REVIEW_LOG: ${{ runner.temp }}/review.log
+        FACTS_FILE: ${{ runner.temp }}/cr-facts.json
+        # The proxy writes the guardrail/firewall reason here on a block; a later
+        # always()-step posts it to the PR (the cascade itself fails closed).
+        POLICY_BLOCK: ${{ runner.temp }}/policy-block.json
+      run: |
+        set -e
+
+        # Security: we run with secrets against the PR head on pull_request_target,
+        # so never let PR-controlled config weaken the review. A fork could commit
+        # `.opencodereview/rule.json` to exclude its own changed files or replace
+        # the built-in checks, yielding an empty result that passes/promotes as
+        # clean. Drop it so OCR uses system defaults + our --background instruction.
+        rm -rf .opencodereview
+
+        # Clear any stale block file before the proxy can write a fresh one. On a
+        # self-hosted runner $RUNNER_TEMP may be reused, and the always()-step
+        # below trusts whatever is here — a leftover block from an earlier run
+        # would post a false "merge is blocked" comment on this clean run.
+        rm -f "$POLICY_BLOCK"
+
+        # Start the in-job fact-injecting proxy (loopback, ephemeral). OCR can't
+        # send custom headers; the proxy stamps x-cr-* facts (from $FACTS_FILE,
+        # re-read per request) so the router's DSL can route on them.
+        echo '{}' > "$FACTS_FILE"
+        CR_FACTS_FILE="$FACTS_FILE" CR_POLICY_BLOCK_FILE="$POLICY_BLOCK" node "$PROXY" > "$RUNNER_TEMP/proxy.out" 2> "$RUNNER_TEMP/proxy.err" &
+        PROXY_PID=$!
+        trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT
+        for _ in $(seq 1 50); do
+          OCR_LLM_URL=$(sed -n 's/^PROXY_URL=//p' "$RUNNER_TEMP/proxy.out")
+          [ -n "$OCR_LLM_URL" ] && break
+          sleep 0.1
+        done
+        if [ -z "$OCR_LLM_URL" ]; then
+          echo "::error::$BRAND: fact proxy failed to start."; cat "$RUNNER_TEMP/proxy.err"; exit 1
+        fi
+        export OCR_LLM_URL
+
+        # Set the raw facts the DSL routes on for the NEXT review pass.
+        #   $1 = prev tier (cheap|strong), $2 = prev pass found a fix-first (true|false)
+        set_facts() {
+          printf '{"x-cr-prev-tier":"%s","x-cr-prev-p0p1":"%s"}' "$1" "$2" > "$FACTS_FILE"
+        }
+
+        # Run OCR once and fail closed on an unusable/partial result. The router
+        # alias + injected facts pick the model. The severity-tag mandate rides on
+        # --background (additive) rather than --rule: --rule is the highest-priority
+        # layer and would REPLACE OCR's built-in language/security rules wholesale,
+        # gutting the bug-finding we advertise. --background layers on top of those.
+        #   $1 = log label, $2 = prev tier fact, $3 = prev fix-first fact
+        run_review() {
+          set_facts "$2" "$3"
+          echo "::group::Review — $1"
+          rc=0
+          ocr review --from "$BASE" --to "$HEAD" \
+            --background "$(cat "$INSTRUCTION")" --format json \
+            > "$RESULT" 2> "$REVIEW_LOG" || rc=$?
+          cat "$REVIEW_LOG"
+          echo "::endgroup::"
+          if ! node "$CHECK" "$RESULT" "$rc"; then
+            echo "::error::$BRAND: review engine produced no usable result — failing closed."
+            exit 1
+          fi
+        }
+
+        # Single-run cascade. A promoted PR (tier 1) injects prev-tier=strong, so
+        # the DSL's `promoted` rule keeps it on strong. A tier-0 PR injects the
+        # cheap-tier facts first; if that pass is clear of FIX_FIRST (P0/P1) we
+        # escalate IN THIS SAME RUN by injecting prev-tier=cheap/prev-p0p1=false
+        # (the DSL's `escalate` rule -> strong) — so the strong tier always reviews
+        # before the PR can merge — and record the promotion so later pushes skip
+        # the cheap pass. If the cheap tier still finds FIX_FIRST, hold the strong
+        # tier until those are fixed.
+        PROMOTE=false
+        HELD=false
+        if [ "$TIER_STATE" = "1" ]; then
+          run_review "strong tier (promoted)" "strong" "false"
+        else
+          run_review "cheap tier" "cheap" "true"
+          if node "$GATE" "$RESULT" --has "$FIX_FIRST"; then
+            echo "Cheap tier found $FIX_FIRST — holding the strong tier until those are fixed."
+            HELD=true
+          else
+            echo "Cheap tier clear of $FIX_FIRST — escalating to the strong tier now."
+            run_review "strong tier (escalation)" "cheap" "false"
+            PROMOTE=true
+          fi
+        fi
+        echo "promote=$PROMOTE" >> "$GITHUB_OUTPUT"
+        # `held` means the cheap tier withheld the strong review on fix-first
+        # findings; the gate must block so the PR can't merge with an unfixed
+        # P0/P1 that the strong tier never even saw.
+        echo "held=$HELD" >> "$GITHUB_OUTPUT"
+
+    # If a dashboard guardrail/firewall blocked the request, the cascade above
+    # failed closed and the normal review comment never runs. Surface the reason
+    # on the PR so the block is actionable, not just a red X with a log line.
+    # always() so it posts despite the failed cascade; no-op when no block file.
+    - name: Surface guardrail / firewall block
+      if: always()
+      uses: actions/github-script@v7
+      env:
+        BRAND: ${{ inputs.brand }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+        POLICY_BLOCK: ${{ runner.temp }}/policy-block.json
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          let block;
+          try {
+            block = JSON.parse(fs.readFileSync(process.env.POLICY_BLOCK, 'utf8'));
+          } catch {
+            return; // no guardrail/firewall block this run
+          }
+          const brand = process.env.BRAND;
+          const num = Number(process.env.PR_NUMBER);
+          const repo = { owner: context.repo.owner, repo: context.repo.repo };
+          const layer = block.kind === 'firewall' ? 'firewall' : 'guardrail';
+          const policyLine = block.policyName
+            ? `\n\n**Policy:** \`${String(block.policyName).slice(0, 120)}\``
+            : '';
+          const detail = block.detail ? String(block.detail).slice(0, 300) : '';
+          const matchedLine = detail ? `\n\n**Matched:** ${detail}` : '';
+          const idTag = block.requestId
+            ? ` · request id \`${String(block.requestId).slice(0, 80)}\``
+            : '';
+          const footer =
+            `\n\n<sub>Reviewed via [OrcaRouter](https://orcarouter.ai) — ` +
+            `Route Smarter. Ship Safer. Spend Less.${idTag}</sub>`;
+          const body =
+            `## 🐳 ${brand}\n\n` +
+            `🛡️ **Review blocked by a ${layer} policy.**` +
+            policyLine +
+            matchedLine +
+            `\n\nOrcaRouter's ${layer} matched this PR against a configured policy and ` +
+            `stopped the request **before it reached the model** — the flagged content was ` +
+            `never sent to the LLM provider. Because the diff wasn't reviewed, the merge is blocked.` +
+            `\n\n**What to do**\n` +
+            `- Remove or fix the flagged content (commonly a secret, credential, or other restricted text in the diff).\n` +
+            `- Keep secrets out of the repo — use GitHub Actions secrets or a secrets manager, referenced at deploy time.\n` +
+            `- If a real secret was exposed, rotate it now.\n` +
+            `- Push the fix and the review will re-run automatically.` +
+            footer;
+          await github.rest.issues.createComment({ ...repo, issue_number: num, body });
+
+    - name: Promote tier
+      if: steps.cascade.outputs.promote == 'true'
+      uses: actions/github-script@v7
+      env:
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const num = Number(process.env.PR_NUMBER);
+          const repo = { owner: context.repo.owner, repo: context.repo.repo };
+          const name = 'orca-review:strong';
+
+          // The documented setup does not create this label, and addLabels only
+          // attaches labels that already exist — so ensure it exists first,
+          // otherwise the very first promotion would fail instead of recording.
+          try {
+            await github.rest.issues.getLabel({ ...repo, name });
+          } catch (e) {
+            if (e.status !== 404) throw e;
+            try {
+              await github.rest.issues.createLabel({
+                ...repo, name, color: '0e8a16',
+                description: 'OrcaRouter Code Review: promoted to the strong model tier',
+              });
+              core.info(`Created repository label ${name}.`);
+            } catch (e2) {
+              // A parallel first promotion may have created it between our
+              // getLabel and createLabel — 422 "already_exists" is fine.
+              if (e2.status !== 422) throw e2;
+              core.info(`Label ${name} was created concurrently — continuing.`);
+            }
+          }
+
+          await github.rest.issues.addLabels({ ...repo, issue_number: num, labels: [name] });
+          core.info(`PR #${num} promoted to review tier 1 (strong model).`);
+
+    - name: Post review comments
+      uses: actions/github-script@v7
+      env:
+        BRAND: ${{ inputs.brand }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+        HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        RESULT: ${{ runner.temp }}/result.json
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          const brand = process.env.BRAND;
+          const num = Number(process.env.PR_NUMBER);
+          const sha = process.env.HEAD_SHA;
+          const repo = { owner: context.repo.owner, repo: context.repo.repo };
+
+          let result = { comments: [] };
+          try {
+            result = JSON.parse(fs.readFileSync(process.env.RESULT, 'utf8'));
+          } catch (e) {
+            console.log('Could not parse result.json:', e.message);
+          }
+          const comments = result.comments || [];
+          // OrcaRouter design: 🐳 header, colored severity dots, brand tagline.
+          const SEV = { P0: '🔴', P1: '🟠', P2: '🟡' };
+          // Attribution for the Apache-2.0 engine lives in NOTICE + README, not
+          // in every comment — OCR is consumed as a package, not redistributed.
+          const footer =
+            `\n\n<sub>Reviewed via [OrcaRouter](https://orcarouter.ai) — ` +
+            `Route Smarter. Ship Safer. Spend Less.</sub>`;
+
+          if (comments.length === 0) {
+            await github.rest.issues.createComment({
+              ...repo, issue_number: num,
+              body: `## 🐳 ${brand}\n\nNo issues found. ✅${footer}`,
+            });
+            return;
+          }
+
+          // Severity from the LEADING [P0]/[P1]/[P2] tag only (mirrors gate.mjs);
+          // a later mention must not override the missing-tag P1 fail-safe.
+          const tagRe = /^\s*\[(P[012])\]\s*/i;
+          const sevOf = (c) => {
+            const m = String(c.content || '').match(tagRe);
+            return m ? m[1].toUpperCase() : 'P1';
+          };
+          // Display form (Codex-style): a colored severity badge, then a bold
+          // subtitle + prose ONLY when we can split cleanly; otherwise the finding
+          // stays whole. OCR emits a single `[Px] <prose>` string with no title
+          // field, and a forced split reads worse than no split (mid-phrase breaks,
+          // lowercase fragments). So we split on just two reliable signals: a
+          // model-written **bold** lead, or a short first sentence (which keeps the
+          // body starting on a fresh, capitalized sentence). Anything else: whole.
+          const decorate = (c) => {
+            const text = String(c.content || '');
+            const m = text.match(tagRe);
+            const sev = m ? m[1].toUpperCase() : 'P1';
+            const badge = `${SEV[sev]} **${sev}**`;
+            const raw = (m ? text.slice(m[0].length) : text).trim();
+            const mk = (t) => t.replace(/\*\*/g, '').replace(/[.!?]+$/, '').trim();
+            // 1) The model sometimes writes its own **bold** lead — use it verbatim.
+            const lead = raw.match(/^\*\*(.+?)\*\*\s+([\s\S]+)$/);
+            if (lead) {
+              return `${badge} **${mk(lead[1])}**\n\n${lead[2].replace(/\*\*/g, '').trim()}`;
+            }
+            // 2) Else split only when the first sentence is short enough to title.
+            const rest = raw.replace(/\*\*/g, '');
+            const end = rest.search(/(?<=[.!?])\s/);
+            if (end > 0 && end <= 72) {
+              return `${badge} **${mk(rest.slice(0, end))}**\n\n${rest.slice(end).trim()}`;
+            }
+            // 3) Hard to separate cleanly — keep the finding whole.
+            return `${badge} ${rest}`;
+          };
+          const counts = {};
+          for (const c of comments) counts[sevOf(c)] = (counts[sevOf(c)] || 0) + 1;
+          const breakdown = ['P0', 'P1', 'P2']
+            .filter((s) => counts[s])
+            .map((s) => `${SEV[s]} ${counts[s]} ${s}`)
+            .join(' · ');
+          const n = comments.length;
+          const summary =
+            `## 🐳 ${brand}\n\n` +
+            `Found **${n}** issue${n === 1 ? '' : 's'} in this PR: ${breakdown}.`;
+
+          const inline = [];
+          const rest = [];
+          for (const c of comments) {
+            const line =
+              c.end_line >= 1 ? c.end_line : c.start_line >= 1 ? c.start_line : 0;
+            if (line >= 1 && c.path) {
+              inline.push({ path: c.path, line, side: 'RIGHT', body: decorate(c) });
+            } else {
+              rest.push(c);
+            }
+          }
+          let body = summary;
+          for (const c of rest) body += `\n\n---\n\`${c.path}\`: ${decorate(c)}`;
+
+          try {
+            await github.rest.pulls.createReview({
+              ...repo, pull_number: num, commit_id: sha,
+              body: body + footer, event: 'COMMENT',
+              comments: inline,
+            });
+          } catch (e) {
+            console.log('Inline review failed, posting findings as a comment:', e.message);
+            // The inline batch carries the actual findings; if GitHub rejects it
+            // (uncommentable line, batch too large) append them as text so users
+            // still see the details instead of bare counts.
+            let fallback = body;
+            for (const c of inline) {
+              fallback += `\n\n---\n\`${c.path}\` (line ${c.line}): ${c.body}`;
+            }
+            await github.rest.issues.createComment({ ...repo, issue_number: num, body: fallback + footer });
+          }
+
+    - name: Enforce severity gate
+      shell: bash
+      env:
+        BRAND: ${{ inputs.brand }}
+        BLOCK_ON: ${{ inputs.block-on }}
+        FIX_FIRST: ${{ inputs.fix-first }}
+        HELD: ${{ steps.cascade.outputs.held }}
+        GATE: ${{ github.action_path }}/scripts/gate.mjs
+        RESULT: ${{ runner.temp }}/result.json
+      run: |
+        if [ "$HELD" = "true" ]; then
+          echo "::error::$BRAND: cheap tier found $FIX_FIRST finding(s) to fix before the strong-tier review runs — blocking."
+          exit 1
+        fi
+        if node "$GATE" "$RESULT" --has "$BLOCK_ON"; then
+          echo "::error::$BRAND: blocking — found $BLOCK_ON severity finding(s)."
+          exit 1
+        fi
+        echo "$BRAND: no $BLOCK_ON findings — gate passed."
+
+    - name: Clean up engine output
+      if: always()
+      shell: bash
+      run: |
+        # Remove only the files THIS run created in $RUNNER_TEMP so review output
+        # doesn't linger across jobs on a self-hosted runner. We deliberately do
+        # not touch ~/.opencodereview: we never write the shared config (all OCR
+        # settings come from env vars), and deleting it would corrupt the OCR
+        # state of other jobs/users on the same runner.
+        rm -f "$RUNNER_TEMP/result.json" "$RUNNER_TEMP/review.log" \
+          "$RUNNER_TEMP/cr-facts.json" "$RUNNER_TEMP/proxy.out" "$RUNNER_TEMP/proxy.err" \
+          "$RUNNER_TEMP/policy-block.json"

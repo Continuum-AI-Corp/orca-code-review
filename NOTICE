@@ -1,0 +1,12 @@
+OrcaRouter Code Review
+Copyright 2026 OrcaRouter
+
+This product orchestrates Open Code Review ("ocr"), an open-source code review
+tool by Alibaba Group, licensed under the Apache License, Version 2.0:
+
+    https://github.com/alibaba/open-code-review
+
+Open Code Review is installed and invoked as the LLM review engine. This product
+adds, on top of it: OrcaRouter gateway integration, a cost-tiered model cascade,
+a severity rubric (P0/P1/P2), and merge-gating. No Open Code Review source is
+modified or redistributed here — it is consumed as a published package.
