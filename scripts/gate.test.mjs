@@ -13,15 +13,16 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { after, before, describe, test } from "node:test";
+import assert from "node:assert/strict";
 
 const GATE = join(dirname(fileURLToPath(import.meta.url)), "gate.mjs");
 let dir;
 
-beforeAll(() => {
+before(() => {
   dir = mkdtempSync(join(tmpdir(), "gate-test-"));
 });
-afterAll(() => {
+after(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -44,50 +45,54 @@ const BLOCK_ON = "P0"; // severities that block the merge
 
 describe("promotion decision (--has FIX_FIRST)", () => {
   test("P0 present -> match (stay on cheap tier, fix first)", () => {
-    expect(gate(["[P0] sql injection", "[P2] use const"], FIX_FIRST)).toBe(0);
+    assert.equal(gate(["[P0] sql injection", "[P2] use const"], FIX_FIRST), 0);
   });
 
   test("P1 present -> match (stay on cheap tier)", () => {
-    expect(gate(["[P1] possible null deref"], FIX_FIRST)).toBe(0);
+    assert.equal(gate(["[P1] possible null deref"], FIX_FIRST), 0);
   });
 
   test("P2-only -> no match (promote PR to strong tier)", () => {
-    expect(gate(["[P2] use const", "[P2] dead code"], FIX_FIRST)).toBe(1);
+    assert.equal(gate(["[P2] use const", "[P2] dead code"], FIX_FIRST), 1);
   });
 
   test("clean (no findings) -> no match (promote PR to strong tier)", () => {
-    expect(gate([], FIX_FIRST)).toBe(1);
+    assert.equal(gate([], FIX_FIRST), 1);
   });
 
   test("untagged finding -> treated as P1 (stay on cheap tier, fail-safe)", () => {
-    expect(gate(["no severity tag, but a real bug"], FIX_FIRST)).toBe(0);
+    assert.equal(gate(["no severity tag, but a real bug"], FIX_FIRST), 0);
   });
 });
 
 describe("merge gate (--has BLOCK_ON)", () => {
   test("P0 present -> match (block the merge)", () => {
-    expect(gate(["[P0] exposed secret"], BLOCK_ON)).toBe(0);
+    assert.equal(gate(["[P0] exposed secret"], BLOCK_ON), 0);
   });
 
   test("P1-only -> no match (gate passes)", () => {
-    expect(gate(["[P1] race condition"], BLOCK_ON)).toBe(1);
+    assert.equal(gate(["[P1] race condition"], BLOCK_ON), 1);
   });
 
   test("untagged (P1 fail-safe) does not block on P0", () => {
-    expect(gate(["untagged bug"], BLOCK_ON)).toBe(1);
+    assert.equal(gate(["untagged bug"], BLOCK_ON), 1);
   });
 });
 
 describe("robustness", () => {
   test("missing / unparseable file -> no match (exit 1), never crashes", () => {
-    expect(() => {
-      execFileSync("node", [GATE, join(dir, "does-not-exist.json"), "--has", "P0"], {
-        stdio: "pipe",
-      });
-    }).toThrow(expect.objectContaining({ status: 1 }));
+    assert.throws(
+      () =>
+        execFileSync(
+          "node",
+          [GATE, join(dir, "does-not-exist.json"), "--has", "P0"],
+          { stdio: "pipe" },
+        ),
+      (e) => e.status === 1,
+    );
   });
 
   test("tag is case-insensitive", () => {
-    expect(gate(["[p0] lowercase tag still counts"], BLOCK_ON)).toBe(0);
+    assert.equal(gate(["[p0] lowercase tag still counts"], BLOCK_ON), 0);
   });
 });
