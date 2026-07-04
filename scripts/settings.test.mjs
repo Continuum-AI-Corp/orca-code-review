@@ -430,7 +430,13 @@ describe("action.yml wiring (settings, quiet mode)", () => {
     assert.match(yml, /SETTINGS_ENABLED/, "the fetch step must consume the input");
     const fetch = yml.slice(yml.indexOf("- name: Fetch review settings"), yml.indexOf("- name: Skip review (settings)"));
     assert.match(fetch, /"\$SETTINGS_ENABLED" = "false"/, "settings=false must short-circuit the fetch");
-    assert.match(fetch, /decision=review/, "the short-circuit must still emit decision=review");
+    // The short-circuit must still emit a decision — but a COMPUTED one: the
+    // auto-review-authors allowlist (a workflow-file input, not a dashboard
+    // value) still gates paid auto reviews here, so the disabled branch runs
+    // gate_decision instead of hardcoding review.
+    const disabled = fetch.slice(fetch.indexOf('"$SETTINGS_ENABLED" = "false"'), fetch.indexOf("node \"$SETTINGS_SCRIPT\""));
+    assert.match(disabled, /gate_decision true every_push false/, "settings=false must still apply the author-allowlist spend guard");
+    assert.match(disabled, /echo "decision=\$DECISION"/, "the short-circuit must emit the gated decision, not a hardcoded review");
   });
 
   test("dashboard gating applies to any pull_request* event, not just pull_request_target", () => {
@@ -500,5 +506,98 @@ describe("action.yml: auto-review-authors allowlist gate (author_allowed)", () =
     assert.equal(decide("OWNER, MEMBER", "MEMBER"), "allow");
     // …and still denies an association that is genuinely absent.
     assert.equal(decide("OWNER, MEMBER", "CONTRIBUTOR"), "deny");
+  });
+});
+
+// The auto-event gate (auto_review/trigger/draft + the author allowlist) is
+// factored into `gate_decision()` and shared by BOTH the settings-disabled
+// (workflow-file-authoritative) and settings-enabled (dashboard) paths. Extract
+// the EXACT gate_decision + author_allowed pair from action.yml and drive it the
+// way each path does — the disabled path in particular passes fixed
+// `true every_push false`, so the author allowlist is the only thing that can
+// skip. This is the regression cover for the fork-author spend-guard bypass:
+// with the dashboard fetch off, a disallowed author must STILL be skipped.
+describe("action.yml: gate_decision — shared auto-event gate (both settings paths)", () => {
+  const actionYml = () => readFileSync(join(SCRIPTS, "..", "action.yml"), "utf8");
+
+  // Both function bodies have no nested braces, so a non-greedy match to the
+  // first brace-only line captures each whole regardless of indentation.
+  function extractGate() {
+    const yml = actionYml();
+    const a = yml.match(/author_allowed\(\) \{[\s\S]*?\n[ \t]*\}/);
+    const g = yml.match(/gate_decision\(\) \{[\s\S]*?\n[ \t]*\}/);
+    assert.ok(a, "the author_allowed gate function must exist in action.yml");
+    assert.ok(g, "the gate_decision function must exist in action.yml");
+    return `${a[0]}\n${g[0]}`;
+  }
+
+  // Run gate_decision under the same `set -eo pipefail` GitHub gives
+  // `shell: bash`, with the three env inputs the real step feeds it; returns
+  // "<decision>|<reason>".
+  function gate({ event, list = "", assoc = "NONE", args }) {
+    const script =
+      `set -eo pipefail\n${extractGate()}\n` +
+      `gate_decision ${args}\n` +
+      `printf '%s|%s' "$DECISION" "$REASON"\n`;
+    const r = spawnSync("bash", ["-c", script], {
+      encoding: "utf8",
+      env: { ...process.env, EVENT_NAME: event, AUTO_REVIEW_AUTHORS: list, AUTHOR_ASSOC: assoc },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const [decision, reason] = r.stdout.split("|");
+    return { decision, reason };
+  }
+
+  // The settings-DISABLED branch calls `gate_decision true every_push false`.
+  const disabled = (opts) => gate({ ...opts, args: "true every_push false" });
+
+  describe("settings disabled (workflow-file-authoritative) still applies the author allowlist", () => {
+    test("auto-review-authors=CONTRIBUTOR + a NONE (fork) author -> skip, even with the dashboard fetch off", () => {
+      const { decision, reason } = disabled({ event: "pull_request_target", list: "CONTRIBUTOR", assoc: "NONE" });
+      assert.equal(decision, "skip");
+      assert.match(reason, /not in auto-review-authors/);
+    });
+
+    test("auto-review-authors=CONTRIBUTOR + an allowed (CONTRIBUTOR) author -> review", () => {
+      assert.equal(disabled({ event: "pull_request_target", list: "CONTRIBUTOR", assoc: "CONTRIBUTOR" }).decision, "review");
+    });
+
+    test("a plain `pull_request` event is gated the same as pull_request_target", () => {
+      assert.equal(disabled({ event: "pull_request", list: "MEMBER", assoc: "NONE" }).decision, "skip");
+    });
+
+    test("an empty allowlist allows everyone (default preserved)", () => {
+      assert.equal(disabled({ event: "pull_request_target", list: "", assoc: "NONE" }).decision, "review");
+    });
+
+    test("a comment command (issue_comment) still proceeds even for a disallowed author", () => {
+      // On-demand /orcarouter-review is maintainer-gated in the workflow `if:`;
+      // the settings gate must NOT additionally skip it.
+      assert.equal(disabled({ event: "issue_comment", list: "CONTRIBUTOR", assoc: "NONE" }).decision, "review");
+    });
+  });
+
+  describe("settings enabled path: the factored gate preserves every skip reason", () => {
+    test("auto_review=false -> skip (dashboard disabled)", () => {
+      const { decision, reason } = gate({ event: "pull_request_target", args: "false every_push false" });
+      assert.equal(decision, "skip");
+      assert.match(reason, /disabled in the OrcaRouter dashboard/);
+    });
+
+    test("trigger=on_demand -> skip", () => {
+      const { decision, reason } = gate({ event: "pull_request_target", args: "true on_demand false" });
+      assert.equal(decision, "skip");
+      assert.match(reason, /on-demand/);
+    });
+
+    test("trigger=ready_for_review + a draft PR -> skip", () => {
+      const { decision, reason } = gate({ event: "pull_request_target", args: "true ready_for_review true" });
+      assert.equal(decision, "skip");
+      assert.match(reason, /draft/);
+    });
+
+    test("trigger=ready_for_review + a ready (non-draft) PR -> review", () => {
+      assert.equal(gate({ event: "pull_request", args: "true ready_for_review false" }).decision, "review");
+    });
   });
 });

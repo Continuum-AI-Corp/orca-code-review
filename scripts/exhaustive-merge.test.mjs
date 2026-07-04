@@ -167,3 +167,102 @@ describe("robustness", () => {
     }
   });
 });
+
+// The exhaustive loop lives in action.yml's `run_review()` bash function, which
+// drives up to two EXTRA engine passes on the strong tier. Extra depth is
+// best-effort — a benign tooling/merge failure must warn+break and keep the
+// findings already in hand (round-2's guarantee) — but a guardrail/firewall
+// POLICY BLOCK on an extra pass is FATAL: OrcaRouter stopped the request before
+// the model, and the always() "Surface guardrail / firewall block" step will
+// post a "merge is blocked" comment, so the required check MUST fail closed too
+// (not go green). Extract the REAL run_review and drive it with stubbed
+// run_pass/node so the failure branch is exercised exactly as written.
+describe("action.yml: exhaustive extra-pass failure handling (run_review)", () => {
+  const actionYml = () => readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "action.yml"), "utf8");
+
+  // run_review's body has no nested braces (only for/if/case), so a non-greedy
+  // match to the first brace-only line captures the whole function.
+  function extractRunReview() {
+    const m = actionYml().match(/run_review\(\) \{[\s\S]*?\n[ \t]*\}/);
+    assert.ok(m, "run_review must exist in action.yml");
+    return m[0];
+  }
+
+  // mode: policy | benign | merge. The stub run_pass makes the PRIMARY pass
+  // (into $RESULT) succeed with one finding; the EXTRA pass (into $RESULT_EXTRA)
+  // either records a policy block + fails (policy), fails with no block
+  // (benign), or succeeds so the following merge can fail (merge). node() stubs
+  // $GATE (always "no fix-first in hand" so the loop reaches the extra pass) and
+  // $MERGE (fails only in merge mode).
+  function runExhaustion(mode) {
+    const id = Math.random().toString(36).slice(2);
+    const RESULT = join(dir, `${id}-result.json`);
+    const RESULT_EXTRA = join(dir, `${id}-extra.json`);
+    const RESULT_MERGED = join(dir, `${id}-merged.json`);
+    const POLICY_BLOCK = join(dir, `${id}-policy-block.json`);
+    const PRIMARY = '{"comments":[{"path":"a.js","start_line":1,"end_line":1,"content":"[P2] primary finding"}],"warnings":[]}';
+    const stubs = `
+run_pass() {
+  if [ "$1" = "$RESULT" ]; then
+    printf '%s' '${PRIMARY}' > "$1"
+    return 0
+  fi
+  case "$EXTRA_MODE" in
+    policy) printf '{"kind":"guardrail","policyName":"pii"}' > "$POLICY_BLOCK"; return 1 ;;
+    benign) return 1 ;;
+    merge)  printf '{"comments":[],"warnings":[]}' > "$1"; return 0 ;;
+  esac
+}
+node() {
+  case "$1" in
+    "$GATE")  return 1 ;;
+    "$MERGE") if [ "$EXTRA_MODE" = "merge" ]; then return 1; fi; printf '{"new_findings":0}'; return 0 ;;
+    -pe)      printf '0'; return 0 ;;
+  esac
+}
+`;
+    const script =
+      `set -eo pipefail\n${extractRunReview()}\n${stubs}\n` +
+      `run_review "strong (escalation)" "cheap" "false" true\n` +
+      `echo "SURVIVED passes=$PASSES"\n`;
+    const r = spawnSync("bash", ["-c", script], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        EXHAUSTIVE: "true",
+        BRAND: "TestBrand",
+        RESULT, RESULT_EXTRA, RESULT_MERGED, POLICY_BLOCK,
+        GATE: "/stub/gate.mjs",
+        MERGE: "/stub/merge.mjs",
+        FIX_FIRST: "P0,P1",
+        EXTRA_MODE: mode,
+      },
+    });
+    return { r, RESULT, POLICY_BLOCK };
+  }
+
+  test("an extra-pass POLICY BLOCK fails the job closed (not swallowed as a warning)", () => {
+    const { r } = runExhaustion("policy");
+    assert.equal(r.status, 1, `a policy block must fail closed; stdout=${r.stdout} stderr=${r.stderr}`);
+    assert.match(r.stdout + r.stderr, /blocked by a guardrail\/firewall policy/);
+    assert.doesNotMatch(r.stdout, /SURVIVED/, "the step must not continue past a policy block");
+  });
+
+  test("an extra-pass BENIGN failure (no policy block) warns, breaks, and keeps the findings so far", () => {
+    const { r, RESULT } = runExhaustion("benign");
+    assert.equal(r.status, 0, `a benign extra-pass failure must not fail the job; stderr=${r.stderr}`);
+    assert.match(r.stdout, /SURVIVED/, "exhaustion must end gracefully");
+    assert.match(r.stdout + r.stderr, /produced no usable result/);
+    const kept = JSON.parse(readFileSync(RESULT, "utf8"));
+    assert.equal(kept.comments.length, 1, "the primary finding must survive");
+  });
+
+  test("an extra-pass MERGE failure warns, breaks, and keeps the findings so far (round-2 guarantee)", () => {
+    const { r, RESULT } = runExhaustion("merge");
+    assert.equal(r.status, 0, `a merge/tooling failure must not fail the job; stderr=${r.stderr}`);
+    assert.match(r.stdout, /SURVIVED/);
+    assert.match(r.stdout + r.stderr, /merge failed/);
+    const kept = JSON.parse(readFileSync(RESULT, "utf8"));
+    assert.equal(kept.comments.length, 1, "the primary finding must survive a merge failure");
+  });
+});

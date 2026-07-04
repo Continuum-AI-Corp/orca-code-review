@@ -224,14 +224,70 @@ runs:
         AUTHOR_ASSOC: ${{ steps.pr.outputs.author_association }}
         AUTO_REVIEW_AUTHORS: ${{ inputs.auto-review-authors }}
       run: |
+        # The auto-event gate is defined UP FRONT — before the settings-disabled
+        # short-circuit — so BOTH the settings-disabled (workflow-file-
+        # authoritative) and settings-enabled (dashboard) paths share the exact
+        # same spend guards. The auto-review-authors allowlist in particular is a
+        # WORKFLOW-FILE input, not a dashboard value, so it must gate paid auto
+        # reviews on public repos REGARDLESS of whether the dashboard fetch ran.
+
+        # Spend guard for public repos: only auto-review PRs whose author
+        # association is in the allowlist. Factored into a function so it is
+        # unit-tested directly (settings.test.mjs extracts and runs this exact
+        # code). Both sides are space-trimmed the way the JS list parsers are,
+        # so "OWNER, MEMBER" still anchors on ",MEMBER,"; the comma wrapping
+        # keeps the match a whole-token one (MEMBER never matches inside
+        # FIRST_TIME_CONTRIBUTOR). An empty (or all-space) allowlist allows
+        # everyone (default, preserves behavior). echoes allow|deny.
+        author_allowed() {
+          local list assoc
+          list=$(printf '%s' "$1" | tr -d ' ')
+          assoc=$(printf '%s' "$2" | tr -d ' ')
+          if [ -z "$list" ]; then echo allow; return; fi
+          if printf '%s' ",$list," | grep -qi ",$assoc,"; then echo allow; else echo deny; fi
+        }
+
+        # Auto-event gate -> sets DECISION/REASON. Only AUTO runs are gated —
+        # any pull_request* event, so a hand-written plain `pull_request`
+        # workflow honors gating exactly like the documented
+        # `pull_request_target` one. An explicit `/orcarouter-review` comment
+        # command (issue_comment) always proceeds — on-demand mode exists
+        # precisely for those, and a human asking for a review of a
+        # draft/disabled repo is deliberate. Shared by both settings paths so the
+        # author-allowlist spend guard holds whether or not the dashboard fetch
+        # ran. $1=auto_review $2=trigger $3=is_draft.
+        gate_decision() {
+          DECISION=review
+          REASON=""
+          case "$EVENT_NAME" in
+            pull_request*)
+              if [ "$1" = "false" ]; then
+                DECISION=skip; REASON="auto-review is disabled in the OrcaRouter dashboard"
+              elif [ "$2" = "on_demand" ]; then
+                DECISION=skip; REASON="on-demand mode"
+              elif [ "$2" = "ready_for_review" ] && [ "$3" = "true" ]; then
+                DECISION=skip; REASON="draft PR"
+              elif [ "$(author_allowed "$AUTO_REVIEW_AUTHORS" "$AUTHOR_ASSOC")" = deny ]; then
+                # Maintainer comment commands are unaffected (gated in the workflow `if:`).
+                DECISION=skip; REASON="author association $AUTHOR_ASSOC not in auto-review-authors"
+              fi
+              ;;
+          esac
+        }
+
         # `settings: "false"` makes the workflow FILE authoritative: skip the
         # fetch entirely, so inputs (or their documented defaults) apply as-is
         # and no dashboard value can override them. (With the fetch on, an
         # input left AT its documented default defers to the server — see the
         # precedence rule below — so e.g. a deliberate `block-on: "P0,P1"` pin
-        # could still be overridden from the dashboard.)
+        # could still be overridden from the dashboard.) auto_review/trigger are
+        # fixed on (true/every_push) in this mode, so gate_decision can only skip
+        # via the author allowlist — a fork author still can't spend on a public
+        # repo just because the dashboard fetch is off.
         if [ "$SETTINGS_ENABLED" = "false" ]; then
           echo "settings: disabled via the 'settings' input — the workflow file is authoritative."
+          gate_decision true every_push false
+          echo "settings: workflow-file-authoritative -> $DECISION ${REASON:+($REASON)}"
           {
             echo "auto_review=true"
             echo "trigger=every_push"
@@ -240,8 +296,8 @@ runs:
             echo "fix_first=$INPUT_FIX_FIRST"
             echo "block_on=$INPUT_BLOCK_ON"
             echo "rubric_file="
-            echo "decision=review"
-            echo "reason="
+            echo "decision=$DECISION"
+            echo "reason=$REASON"
           } >> "$GITHUB_OUTPUT"
           exit 0
         fi
@@ -280,44 +336,11 @@ runs:
         fi
 
         # Settings gate — composable with the diff guard's `decision != 'skip'`.
-        # Only AUTO runs are gated — any pull_request* event, so a hand-written
-        # plain `pull_request` workflow honors dashboard gating exactly like
-        # the documented `pull_request_target` one. An explicit
-        # `/orcarouter-review` comment command (issue_comment) always proceeds —
-        # on-demand mode exists precisely for those, and a human asking for a
-        # review of a draft/disabled repo is deliberate.
-        # Spend guard for public repos: only auto-review PRs whose author
-        # association is in the allowlist. Factored into a function so it is
-        # unit-tested directly (settings.test.mjs extracts and runs this exact
-        # code). Both sides are space-trimmed the way the JS list parsers are,
-        # so "OWNER, MEMBER" still anchors on ",MEMBER,"; the comma wrapping
-        # keeps the match a whole-token one (MEMBER never matches inside
-        # FIRST_TIME_CONTRIBUTOR). An empty (or all-space) allowlist allows
-        # everyone (default, preserves behavior). echoes allow|deny.
-        author_allowed() {
-          local list assoc
-          list=$(printf '%s' "$1" | tr -d ' ')
-          assoc=$(printf '%s' "$2" | tr -d ' ')
-          if [ -z "$list" ]; then echo allow; return; fi
-          if printf '%s' ",$list," | grep -qi ",$assoc,"; then echo allow; else echo deny; fi
-        }
-
-        DECISION=review
-        REASON=""
-        case "$EVENT_NAME" in
-          pull_request*)
-            if [ "$AUTO_REVIEW" = "false" ]; then
-              DECISION=skip; REASON="auto-review is disabled in the OrcaRouter dashboard"
-            elif [ "$TRIGGER" = "on_demand" ]; then
-              DECISION=skip; REASON="on-demand mode"
-            elif [ "$TRIGGER" = "ready_for_review" ] && [ "$IS_DRAFT" = "true" ]; then
-              DECISION=skip; REASON="draft PR"
-            elif [ "$(author_allowed "$AUTO_REVIEW_AUTHORS" "$AUTHOR_ASSOC")" = deny ]; then
-              # Maintainer comment commands are unaffected (gated in the workflow `if:`).
-              DECISION=skip; REASON="author association $AUTHOR_ASSOC not in auto-review-authors"
-            fi
-            ;;
-        esac
+        # Same gate_decision as the settings-disabled path (defined at the top of
+        # this step): the dashboard-fetched auto_review/trigger feed it here,
+        # while the author-allowlist spend guard inside it is identical in both
+        # paths.
+        gate_decision "$AUTO_REVIEW" "$TRIGGER" "$IS_DRAFT"
         echo "settings: auto_review=$AUTO_REVIEW trigger=$TRIGGER exhaustive=$EXHAUSTIVE quiet=$QUIET fix_first=$FIX_FIRST block_on=$BLOCK_ON rubric=${RUBRIC_OUT:+custom} -> $DECISION ${REASON:+($REASON)}"
         {
           echo "auto_review=$AUTO_REVIEW"
@@ -662,6 +685,22 @@ runs:
               break
             fi
             if ! run_pass "$RESULT_EXTRA" "$1 — exhaustive pass $extra" "$2" "$3"; then
+              # A guardrail/firewall POLICY BLOCK on an extra pass is FATAL —
+              # exactly like on the primary pass. The proxy records the block to
+              # $POLICY_BLOCK (cleared at step start, and no earlier pass wrote
+              # it — its presence pins the block to THIS pass) and OrcaRouter
+              # stopped the request BEFORE the model, so the review is
+              # incomplete. Swallowing it as a warning would let the required
+              # check go green while the always() "Surface guardrail / firewall
+              # block" step posts a "merge is blocked" comment — a contradiction.
+              # Fail closed; that surface step then renders the reason.
+              if [ -f "$POLICY_BLOCK" ]; then
+                echo "::error::$BRAND: exhaustive pass $extra blocked by a guardrail/firewall policy — failing closed."
+                exit 1
+              fi
+              # Otherwise a benign tooling failure (engine crash / partial
+              # result): extra depth is best-effort, so warn and END exhaustion,
+              # keeping the findings already in hand.
               echo "::warning::$BRAND: exhaustive pass $extra produced no usable result — keeping the findings so far."
               break
             fi
