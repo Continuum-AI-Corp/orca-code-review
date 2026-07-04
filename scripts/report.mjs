@@ -20,6 +20,7 @@
 
 import fs from "node:fs";
 import { countSeverities } from "./severity.mjs";
+import { controlPlaneBase } from "./control-plane.mjs";
 
 const TIMEOUT_MS = 5000;
 const RETRY_PAUSE_MS = 500;
@@ -71,7 +72,7 @@ async function main() {
 
   let endpoint;
   try {
-    endpoint = `${new URL(opts.url).origin}/api/code_review/report`;
+    endpoint = `${controlPlaneBase(opts.url)}/api/code_review/report`;
   } catch (e) {
     console.error(`report: skipped — bad --url (${e.message})`);
     return;

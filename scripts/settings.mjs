@@ -33,6 +33,7 @@
 
 import fs from "node:fs";
 import { SEVERITIES } from "./severity.mjs";
+import { controlPlaneBase } from "./control-plane.mjs";
 
 const TIMEOUT_MS = 5000;
 const RETRY_PAUSE_MS = 500;
@@ -113,7 +114,7 @@ async function fetchOnce(endpoint, key) {
 async function resolveSettings(opts) {
   let endpoint;
   try {
-    endpoint = `${new URL(opts.url).origin}/api/code_review/settings?repo=${encodeURIComponent(opts.repo)}`;
+    endpoint = `${controlPlaneBase(opts.url)}/api/code_review/settings?repo=${encodeURIComponent(opts.repo)}`;
   } catch (e) {
     console.error(`settings: bad --url (${e.message}) — using built-in defaults`);
     return { ...DEFAULTS };
