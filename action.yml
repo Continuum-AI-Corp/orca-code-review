@@ -18,12 +18,18 @@
 # facts onto OCR's requests; the workspace router's DSL recipe
 # (recipes/code-review.dsl.yaml) maps them to the concrete cheap/strong model.
 #
-# Around the cascade: an oversized-diff guard (scripts/diff-guard.mjs) decides
-# review/skip BEFORE the engine ever runs (a skip passes the check with a
-# notice — it never blocks a merge); one summary comment per PR
-# (scripts/summary-comment.mjs) is upserted in place on every push; and a
-# best-effort per-tier run report (scripts/report.mjs) posts severity counts —
-# never code — to the OrcaRouter control plane after the gate.
+# Around the cascade: dashboard settings (scripts/settings.mjs, fetched
+# fail-open from the gateway) gate auto reviews (auto_review / trigger),
+# retune fix-first/block-on, and switch on quiet mode (P2 muted at posting via
+# scripts/quiet-filter.mjs — the gate/report still see true counts), an
+# exhaustive mode (extra engine passes deduped by
+# scripts/exhaustive-merge.mjs), and a server-side rubric override; an
+# oversized-diff guard (scripts/diff-guard.mjs) decides review/skip BEFORE the
+# engine ever runs (a skip passes the check with a notice — it never blocks a
+# merge); one summary comment per PR (scripts/summary-comment.mjs) is upserted
+# in place on every push; and a best-effort per-tier run report
+# (scripts/report.mjs) posts severity counts — never code — to the OrcaRouter
+# control plane after the gate.
 
 name: "OrcaRouter Code Review"
 description: "AI PR review via the OrcaRouter gateway — cost-tiered cascade with a severity merge gate."
@@ -97,21 +103,26 @@ runs:
       with:
         github-token: ${{ inputs.github-token }}
         script: |
-          let base, headSha, num;
+          let base, headSha, num, isDraft;
           if (context.eventName === 'pull_request_target') {
             base = context.payload.pull_request.base.ref;
             headSha = context.payload.pull_request.head.sha;
             num = context.payload.pull_request.number;
+            isDraft = context.payload.pull_request.draft === true;
           } else {
             num = context.issue.number;
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner, repo: context.repo.repo, pull_number: num,
             });
             base = pr.base.ref; headSha = pr.head.sha;
+            isDraft = pr.draft === true;
           }
           core.setOutput('base', base);
           core.setOutput('head_sha', headSha);
           core.setOutput('number', String(num));
+          // Draft state feeds the settings gate: trigger=ready_for_review
+          // skips auto-reviews while the PR is still a draft.
+          core.setOutput('is_draft', String(isDraft));
 
           // Stateful tier: the PR carries an `orca-review:strong` label once it
           // has been promoted to the strong model. No label means it is still on
@@ -124,7 +135,140 @@ runs:
           core.setOutput('tier', promoted ? '1' : '0');
           core.info(`PR #${num} review tier: ${promoted ? '1 (strong)' : '0 (cheap)'}`);
 
+    # setup-node runs BEFORE checkout (it never reads the workspace) so the
+    # settings fetch below has node available even on a bare self-hosted runner.
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    # Dashboard-driven behavior, fetched from the gateway BEFORE anything is
+    # cloned or installed: a settings-skip should cost nothing. settings.mjs
+    # always exits 0 and falls back to the built-in defaults on any outage
+    # (fail-open — a settings hiccup must never kill reviews); this step's own
+    # parsing falls back the same way, so `decision` is always review|skip.
+    - name: Fetch review settings
+      id: settings
+      shell: bash
+      env:
+        SETTINGS_SCRIPT: ${{ github.action_path }}/scripts/settings.mjs
+        ORCAROUTER_URL: ${{ inputs.orcarouter-url }}
+        ORCAROUTER_API_KEY: ${{ inputs.orcarouter-api-key }}
+        REPO: ${{ github.repository }}
+        SETTINGS_JSON: ${{ runner.temp }}/cr-settings.json
+        RUBRIC_FILE: ${{ runner.temp }}/cr-rubric.md
+        INPUT_FIX_FIRST: ${{ inputs.fix-first }}
+        INPUT_BLOCK_ON: ${{ inputs.block-on }}
+        EVENT_NAME: ${{ github.event_name }}
+        IS_DRAFT: ${{ steps.pr.outputs.is_draft }}
+      run: |
+        node "$SETTINGS_SCRIPT" --url "$ORCAROUTER_URL" --key "$ORCAROUTER_API_KEY" \
+          --repo "$REPO" --out "$SETTINGS_JSON"
+
+        # Read one validated field from the settings file; $2 is the fallback
+        # if the file itself is missing/unreadable (settings.mjs already
+        # defaulted and validated every field it wrote).
+        setting() {
+          node -pe 'String(JSON.parse(require("fs").readFileSync(process.env.SETTINGS_JSON, "utf8"))[process.argv[1]])' \
+            "$1" 2>/dev/null || printf '%s' "$2"
+        }
+        AUTO_REVIEW=$(setting auto_review true)
+        TRIGGER=$(setting trigger every_push)
+        EXHAUSTIVE=$(setting exhaustive false)
+        QUIET=$(setting quiet false)
+        FIX_FIRST=$(setting fix_first "P0,P1")
+        BLOCK_ON=$(setting block_on "P0,P1")
+        RUBRIC=$(setting rubric "")
+
+        # PRECEDENCE (documented in the README): an explicit `with:` input that
+        # DIFFERS from the action's documented default ("P0,P1") wins over the
+        # server settings; an input left at the default defers to the server.
+        if [ "$INPUT_FIX_FIRST" != "P0,P1" ]; then FIX_FIRST="$INPUT_FIX_FIRST"; fi
+        if [ "$INPUT_BLOCK_ON" != "P0,P1" ]; then BLOCK_ON="$INPUT_BLOCK_ON"; fi
+
+        # A non-empty server rubric REPLACES rules/severity-instruction.md as
+        # the --background content; it is exposed as a file path only when set.
+        RUBRIC_OUT=""
+        if [ -n "$RUBRIC" ]; then
+          printf '%s\n' "$RUBRIC" > "$RUBRIC_FILE"
+          RUBRIC_OUT="$RUBRIC_FILE"
+          echo "Using the server-side rubric ($(wc -c < "$RUBRIC_FILE") bytes) instead of the built-in one."
+        fi
+
+        # Settings gate — composable with the diff guard's `decision != 'skip'`.
+        # Only AUTO runs (pull_request_target) are gated: an explicit
+        # `/orcarouter-review` comment command always proceeds — on-demand mode
+        # exists precisely for those, and a human asking for a review of a
+        # draft/disabled repo is deliberate.
+        DECISION=review
+        REASON=""
+        if [ "$EVENT_NAME" = "pull_request_target" ]; then
+          if [ "$AUTO_REVIEW" = "false" ]; then
+            DECISION=skip; REASON="auto-review is disabled in the OrcaRouter dashboard"
+          elif [ "$TRIGGER" = "on_demand" ]; then
+            DECISION=skip; REASON="on-demand mode"
+          elif [ "$TRIGGER" = "ready_for_review" ] && [ "$IS_DRAFT" = "true" ]; then
+            DECISION=skip; REASON="draft PR"
+          fi
+        fi
+        echo "settings: auto_review=$AUTO_REVIEW trigger=$TRIGGER exhaustive=$EXHAUSTIVE quiet=$QUIET fix_first=$FIX_FIRST block_on=$BLOCK_ON rubric=${RUBRIC_OUT:+custom} -> $DECISION ${REASON:+($REASON)}"
+        {
+          echo "auto_review=$AUTO_REVIEW"
+          echo "trigger=$TRIGGER"
+          echo "exhaustive=$EXHAUSTIVE"
+          echo "quiet=$QUIET"
+          echo "fix_first=$FIX_FIRST"
+          echo "block_on=$BLOCK_ON"
+          echo "rubric_file=$RUBRIC_OUT"
+          echo "decision=$DECISION"
+          echo "reason=$REASON"
+        } >> "$GITHUB_OUTPUT"
+
+    # On a settings-skip: leave ONE small marker comment (created if absent,
+    # edited only when the reason changes — repeated pushes must not spam the
+    # timeline or its edit history), then PASS. No later step runs the engine
+    # or the gate, so the job (and a required check) goes green.
+    - name: Skip review (settings)
+      if: steps.settings.outputs.decision == 'skip'
+      uses: actions/github-script@v7
+      env:
+        BRAND: ${{ inputs.brand }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+        REASON: ${{ steps.settings.outputs.reason }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const brand = process.env.BRAND;
+          const num = Number(process.env.PR_NUMBER);
+          const repo = { owner: context.repo.owner, repo: context.repo.repo };
+          // Own marker (distinct from the summary and oversized-skip ones).
+          const MARKER = '<!-- orca-code-review-disabled -->';
+          const footer =
+            `\n\n<sub>Reviewed via [OrcaRouter](https://orcarouter.ai) — ` +
+            `Route Smarter. Ship Safer. Spend Less.</sub>`;
+          const body =
+            `${MARKER}\n## 🐳 ${brand}\n\n` +
+            `⏸️ **Automatic review is off for this PR** (${process.env.REASON}).\n\n` +
+            `The check **passes** — this never blocks your merge. A maintainer can still ` +
+            `run a review on demand by commenting \`/orcarouter-review\`, or change the ` +
+            `repo's review settings in the OrcaRouter dashboard.` +
+            footer;
+
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            ...repo, issue_number: num, per_page: 100,
+          });
+          const existing = comments.find((c) => c.body && c.body.includes(MARKER));
+          if (!existing) {
+            await github.rest.issues.createComment({ ...repo, issue_number: num, body });
+          } else if (existing.body !== body) {
+            // Only when the reason changed (e.g. on_demand -> draft).
+            await github.rest.issues.updateComment({ ...repo, comment_id: existing.id, body });
+          }
+
+          await core.summary.addRaw(`skipped: ${process.env.REASON}`).write();
+          core.notice(`${brand}: review skipped — ${process.env.REASON}`);
+
     - uses: actions/checkout@v4
+      if: steps.settings.outputs.decision != 'skip'
       with:
         fetch-depth: 0 # full history for the merge-base diff
         ref: ${{ steps.pr.outputs.head_sha }}
@@ -134,6 +278,7 @@ runs:
         persist-credentials: false
 
     - name: Fetch PR head (covers fork PRs)
+      if: steps.settings.outputs.decision != 'skip'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -145,12 +290,9 @@ runs:
         git -c "http.extraheader=Authorization: Basic $AUTH" \
           fetch origin "pull/${PR_NUMBER}/head"
 
-    - uses: actions/setup-node@v4
-      with:
-        node-version: "20"
-
     - name: Oversized-diff guard
       id: guard
+      if: steps.settings.outputs.decision != 'skip'
       shell: bash
       env:
         BRAND: ${{ inputs.brand }}
@@ -234,7 +376,7 @@ runs:
           core.notice(`${brand}: review skipped — ${process.env.REASON}`);
 
     - name: Install review engine
-      if: steps.guard.outputs.decision != 'skip'
+      if: steps.settings.outputs.decision != 'skip' && steps.guard.outputs.decision != 'skip'
       shell: bash
       env:
         ENGINE_VERSION: ${{ inputs.engine-version }}
@@ -242,12 +384,17 @@ runs:
 
     - name: Review (stateful cost-tiered cascade)
       id: cascade
-      if: steps.guard.outputs.decision != 'skip'
+      if: steps.settings.outputs.decision != 'skip' && steps.guard.outputs.decision != 'skip'
       shell: bash
       env:
         TIER_STATE: ${{ steps.pr.outputs.tier }}
         ROUTER: ${{ inputs.router }}
-        FIX_FIRST: ${{ inputs.fix-first }}
+        # Effective value after the settings/input precedence rule.
+        FIX_FIRST: ${{ steps.settings.outputs.fix_first }}
+        # Non-empty only when the dashboard supplies a replacement rubric.
+        RUBRIC_FILE: ${{ steps.settings.outputs.rubric_file }}
+        EXHAUSTIVE: ${{ steps.settings.outputs.exhaustive }}
+        MERGE: ${{ github.action_path }}/scripts/exhaustive-merge.mjs
         BASE: origin/${{ steps.pr.outputs.base }}
         HEAD: ${{ steps.pr.outputs.head_sha }}
         INSTRUCTION: ${{ github.action_path }}/rules/severity-instruction.md
@@ -279,6 +426,10 @@ runs:
         # the report steps below need each tier's own severity counts.
         RESULT_CHEAP: ${{ runner.temp }}/result-cheap.json
         RESULT_STRONG: ${{ runner.temp }}/result-strong.json
+        # Exhaustive-mode scratch: each extra engine pass lands in
+        # $RESULT_EXTRA and is deduped into $RESULT via $RESULT_MERGED.
+        RESULT_EXTRA: ${{ runner.temp }}/result-extra.json
+        RESULT_MERGED: ${{ runner.temp }}/result-merged.json
         FACTS_FILE: ${{ runner.temp }}/cr-facts.json
         # The proxy writes the guardrail/firewall reason here on a block; a later
         # always()-step posts it to the PR (the cascade itself fails closed).
@@ -322,25 +473,62 @@ runs:
           printf '{"x-cr-prev-tier":"%s","x-cr-prev-p0p1":"%s"}' "$1" "$2" > "$FACTS_FILE"
         }
 
-        # Run OCR once and fail closed on an unusable/partial result. The router
-        # alias + injected facts pick the model. The severity-tag mandate rides on
-        # --background (additive) rather than --rule: --rule is the highest-priority
-        # layer and would REPLACE OCR's built-in language/security rules wholesale,
-        # gutting the bug-finding we advertise. --background layers on top of those.
-        #   $1 = log label, $2 = prev tier fact, $3 = prev fix-first fact
-        run_review() {
-          set_facts "$2" "$3"
-          echo "::group::Review — $1"
+        # The --background content: severity rubric + tag mandate. A non-empty
+        # server rubric (dashboard settings) REPLACES the built-in
+        # rules/severity-instruction.md wholesale — the [P0]/[P1]/[P2] tag
+        # mandate must live in that server text; the untagged->P1 fail-safe
+        # still catches any slippage. It rides on --background (additive)
+        # rather than --rule: --rule is the highest-priority layer and would
+        # REPLACE OCR's built-in language/security rules wholesale, gutting
+        # the bug-finding we advertise. --background layers on top of those.
+        BACKGROUND="$INSTRUCTION"
+        if [ -n "$RUBRIC_FILE" ] && [ -s "$RUBRIC_FILE" ]; then
+          BACKGROUND="$RUBRIC_FILE"
+          echo "Severity rubric: using the dashboard's server-side override."
+        fi
+
+        # One engine pass into $1; returns nonzero on an unusable/partial
+        # result. The CALLER decides what that means: a tier's FIRST pass
+        # fails the job closed, an exhaustive EXTRA pass just ends the loop
+        # (extra depth is best-effort — findings already in hand must survive).
+        #   $1 = output file, $2 = log label, $3 = prev tier fact, $4 = prev fix-first fact
+        run_pass() {
+          set_facts "$3" "$4"
+          echo "::group::Review — $2"
           rc=0
           ocr review --from "$BASE" --to "$HEAD" \
-            --background "$(cat "$INSTRUCTION")" --format json \
-            > "$RESULT" 2> "$REVIEW_LOG" || rc=$?
+            --background "$(cat "$BACKGROUND")" --format json \
+            > "$1" 2> "$REVIEW_LOG" || rc=$?
           cat "$REVIEW_LOG"
           echo "::endgroup::"
-          if ! node "$CHECK" "$RESULT" "$rc"; then
+          node "$CHECK" "$1" "$rc"
+        }
+
+        # One TIER: the mandatory first pass, then — exhaustive mode only —
+        # up to 2 extra engine passes over the same diff (LLM reviews aren't
+        # exhaustive in one pass), each deduped into $RESULT by
+        # exhaustive-merge.mjs; the loop ends as soon as a pass adds nothing
+        # new. PASSES counts this tier's passes for the summary comment.
+        #   $1 = log label, $2 = prev tier fact, $3 = prev fix-first fact
+        run_review() {
+          if ! run_pass "$RESULT" "$1" "$2" "$3"; then
             echo "::error::$BRAND: review engine produced no usable result — failing closed."
             exit 1
           fi
+          PASSES=1
+          [ "$EXHAUSTIVE" = "true" ] || return 0
+          for extra in 2 3; do
+            if ! run_pass "$RESULT_EXTRA" "$1 — exhaustive pass $extra" "$2" "$3"; then
+              echo "::warning::$BRAND: exhaustive pass $extra produced no usable result — keeping the findings so far."
+              break
+            fi
+            MERGE_OUT=$(node "$MERGE" --base "$RESULT" --new "$RESULT_EXTRA" --out "$RESULT_MERGED")
+            mv "$RESULT_MERGED" "$RESULT"
+            PASSES=$extra
+            NEW_FINDINGS=$(MERGE_JSON="$MERGE_OUT" node -pe 'JSON.parse(process.env.MERGE_JSON).new_findings')
+            echo "exhaustive: pass $extra added $NEW_FINDINGS new finding(s)."
+            [ "$NEW_FINDINGS" -gt 0 ] || break
+          done
         }
 
         # Single-run cascade. A promoted PR (tier 1) injects prev-tier=strong, so
@@ -358,6 +546,7 @@ runs:
         # to a decision", `strong_ran` marks a completed strong pass.
         PROMOTE=false
         HELD=false
+        PASSES=1
         if [ "$TIER_STATE" = "1" ]; then
           run_review "strong tier (promoted)" "strong" "false"
           cp "$RESULT" "$RESULT_STRONG"
@@ -383,6 +572,9 @@ runs:
         # findings; the gate must block so the PR can't merge with an unfixed
         # P0/P1 that the strong tier never even saw.
         echo "held=$HELD" >> "$GITHUB_OUTPUT"
+        # Engine passes behind the FINAL result (the last tier that ran) —
+        # >1 only in exhaustive mode; the summary comment notes it.
+        echo "passes=$PASSES" >> "$GITHUB_OUTPUT"
 
     # If a dashboard guardrail/firewall blocked the request, the cascade above
     # failed closed and the normal review comment never runs. Surface the reason
@@ -391,7 +583,7 @@ runs:
     # The guard condition also keeps a STALE block file from being posted on a
     # skipped run (the cascade's own cleanup never ran on a skip).
     - name: Surface guardrail / firewall block
-      if: always() && steps.guard.outputs.decision != 'skip'
+      if: always() && steps.settings.outputs.decision != 'skip' && steps.guard.outputs.decision != 'skip'
       uses: actions/github-script@v7
       env:
         BRAND: ${{ inputs.brand }}
@@ -474,14 +666,35 @@ runs:
           await github.rest.issues.addLabels({ ...repo, issue_number: num, labels: [name] });
           core.info(`PR #${num} promoted to review tier 1 (strong model).`);
 
+    # What gets POSTED is decoupled from what gets ENFORCED: this step always
+    # produces $RESULT_POSTED for the posting step — a straight copy normally,
+    # or with P2 comments dropped when quiet mode is on (dashboard settings).
+    # The severity gate, the summary counts, and the run reports keep reading
+    # the UNfiltered result: quiet mutes timeline noise, never enforcement.
+    - name: Quiet mode filter
+      if: steps.settings.outputs.decision != 'skip' && steps.guard.outputs.decision != 'skip'
+      shell: bash
+      env:
+        QUIET: ${{ steps.settings.outputs.quiet }}
+        QUIET_FILTER: ${{ github.action_path }}/scripts/quiet-filter.mjs
+        RESULT: ${{ runner.temp }}/result.json
+        RESULT_POSTED: ${{ runner.temp }}/result-posted.json
+      run: |
+        if [ "$QUIET" = "true" ]; then
+          node "$QUIET_FILTER" "$RESULT" --drop P2 --out "$RESULT_POSTED"
+        else
+          cp "$RESULT" "$RESULT_POSTED"
+        fi
+
     - name: Post review comments
-      if: steps.guard.outputs.decision != 'skip'
+      if: steps.settings.outputs.decision != 'skip' && steps.guard.outputs.decision != 'skip'
       uses: actions/github-script@v7
       env:
         BRAND: ${{ inputs.brand }}
         PR_NUMBER: ${{ steps.pr.outputs.number }}
         HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-        RESULT: ${{ runner.temp }}/result.json
+        # The quiet-filtered copy — see the "Quiet mode filter" step above.
+        RESULT: ${{ runner.temp }}/result-posted.json
       with:
         github-token: ${{ inputs.github-token }}
         script: |
@@ -596,17 +809,21 @@ runs:
     # in an HTML comment inside the body), the tier, and the gate verdict.
     # Runs BEFORE the enforce step so a blocked run still updates the summary.
     - name: Summary comment (upsert)
-      if: steps.guard.outputs.decision != 'skip'
+      if: steps.settings.outputs.decision != 'skip' && steps.guard.outputs.decision != 'skip'
       uses: actions/github-script@v7
       env:
         PR_NUMBER: ${{ steps.pr.outputs.number }}
+        # Deliberately the UNfiltered result: the summary shows TRUE counts
+        # (its quiet-mode note explains why fewer P2s appear inline).
         RESULT: ${{ runner.temp }}/result.json
         PREV_BODY: ${{ runner.temp }}/prev-summary.md
         SUMMARY_SCRIPT: ${{ github.action_path }}/scripts/summary-comment.mjs
         GATE: ${{ github.action_path }}/scripts/gate.mjs
-        BLOCK_ON: ${{ inputs.block-on }}
+        BLOCK_ON: ${{ steps.settings.outputs.block_on }}
         HELD: ${{ steps.cascade.outputs.held }}
         STRONG_RAN: ${{ steps.cascade.outputs.strong_ran }}
+        QUIET: ${{ steps.settings.outputs.quiet }}
+        PASSES: ${{ steps.cascade.outputs.passes }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
@@ -646,6 +863,10 @@ runs:
           }
           const tier = process.env.STRONG_RAN === 'true' ? 'strong' : 'cheap';
           args.push('--tier', tier, '--push', String(push), '--gate', blocked ? 'blocked' : 'pass');
+          // Mode notes: exhaustive pass count (renders only when > 1) and the
+          // quiet-mode explainer next to the true counts.
+          args.push('--passes', process.env.PASSES || '1');
+          if (process.env.QUIET === 'true') args.push('--quiet');
 
           const body = execFileSync('node', args, { encoding: 'utf8' });
           if (existing) {
@@ -655,14 +876,16 @@ runs:
           }
 
     - name: Enforce severity gate
-      if: steps.guard.outputs.decision != 'skip'
+      if: steps.settings.outputs.decision != 'skip' && steps.guard.outputs.decision != 'skip'
       shell: bash
       env:
         BRAND: ${{ inputs.brand }}
-        BLOCK_ON: ${{ inputs.block-on }}
-        FIX_FIRST: ${{ inputs.fix-first }}
+        # Effective values after the settings/input precedence rule.
+        BLOCK_ON: ${{ steps.settings.outputs.block_on }}
+        FIX_FIRST: ${{ steps.settings.outputs.fix_first }}
         HELD: ${{ steps.cascade.outputs.held }}
         GATE: ${{ github.action_path }}/scripts/gate.mjs
+        # ALWAYS the unfiltered result — quiet mode never weakens the gate.
         RESULT: ${{ runner.temp }}/result.json
       run: |
         if [ "$HELD" = "true" ]; then
@@ -708,7 +931,7 @@ runs:
         REPORT: ${{ github.action_path }}/scripts/report.mjs
         GATE: ${{ github.action_path }}/scripts/gate.mjs
         RESULT_STRONG: ${{ runner.temp }}/result-strong.json
-        BLOCK_ON: ${{ inputs.block-on }}
+        BLOCK_ON: ${{ steps.settings.outputs.block_on }}
         REPO: ${{ github.repository }}
         PR_NUMBER: ${{ steps.pr.outputs.number }}
         HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -737,6 +960,9 @@ runs:
         # state of other jobs/users on the same runner.
         rm -f "$RUNNER_TEMP/result.json" "$RUNNER_TEMP/review.log" \
           "$RUNNER_TEMP/result-cheap.json" "$RUNNER_TEMP/result-strong.json" \
+          "$RUNNER_TEMP/result-posted.json" "$RUNNER_TEMP/result-extra.json" \
+          "$RUNNER_TEMP/result-merged.json" \
+          "$RUNNER_TEMP/cr-settings.json" "$RUNNER_TEMP/cr-rubric.md" \
           "$RUNNER_TEMP/cr-facts.json" "$RUNNER_TEMP/proxy.out" "$RUNNER_TEMP/proxy.err" \
           "$RUNNER_TEMP/policy-block.json" \
           "$RUNNER_TEMP/pr.diff" "$RUNNER_TEMP/diff-guard.json" "$RUNNER_TEMP/prev-summary.md"

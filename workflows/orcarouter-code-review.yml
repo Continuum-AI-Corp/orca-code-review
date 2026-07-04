@@ -19,8 +19,10 @@ on:
   # `synchronize` re-reviews on every new push — the per-commit review loop. The
   # cascade escalates to the strong tier within a single run (no label-triggered
   # re-run needed — and a GITHUB_TOKEN label change can't trigger one anyway).
+  # `ready_for_review` makes the dashboard's trigger=ready_for_review mode fire
+  # when a draft PR becomes ready (drafts are skipped in that mode).
   pull_request_target:
-    types: [opened, synchronize]
+    types: [opened, synchronize, ready_for_review]
   issue_comment:
     types: [created]
 

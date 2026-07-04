@@ -136,6 +136,46 @@ describe("gate line", () => {
   });
 });
 
+describe("mode notes (exhaustive / quiet)", () => {
+  test("--passes > 1 renders the exhaustive note; state JSON is unchanged", () => {
+    const out = run(["[P0] a"], ["--tier", "strong", "--push", "2", "--gate", "blocked", "--passes", "3"]);
+    assert.ok(out.includes("exhaustive: 3 passes"));
+    assert.deepEqual(JSON.parse(out.match(STATE_RE)[1]), { p0: 1, p1: 0, p2: 0, push: 2 });
+  });
+
+  test("--passes 1 (and no --passes at all) renders NO exhaustive note", () => {
+    const explicit = run([], ["--tier", "strong", "--push", "1", "--gate", "pass", "--passes", "1"]);
+    assert.ok(!explicit.includes("exhaustive"));
+    const absent = run([], ["--tier", "strong", "--push", "1", "--gate", "pass"]);
+    assert.ok(!absent.includes("exhaustive"));
+  });
+
+  test("--quiet renders the P2 note next to the TRUE counts", () => {
+    const out = run(
+      ["[P0] a", "[P2] nit"],
+      ["--tier", "strong", "--push", "1", "--gate", "blocked", "--quiet"],
+    );
+    assert.ok(out.includes("quiet mode: P2 shown in summary only"));
+    assert.ok(out.includes("| P2 | 1 |"), "the summary must keep the true P2 count");
+  });
+
+  test("no --quiet -> no quiet note", () => {
+    const out = run(["[P2] nit"], ["--tier", "strong", "--push", "1", "--gate", "pass"]);
+    assert.ok(!out.includes("quiet mode"));
+  });
+
+  test("a non-numeric or sub-1 --passes exits 2 — a wiring bug must be loud", () => {
+    for (const passes of ["zero", "0", "-1"]) {
+      const r = spawnSync(
+        "node",
+        [SUMMARY, join(dir, "x.json"), "--tier", "strong", "--push", "1", "--gate", "pass", "--passes", passes],
+        { encoding: "utf8" },
+      );
+      assert.equal(r.status, 2, `--passes ${passes} must exit 2`);
+    }
+  });
+});
+
 describe("robustness", () => {
   test("unreadable result.json still renders (zero counts), exit 0", () => {
     const r = spawnSync(

@@ -3,6 +3,7 @@
 //
 //   node summary-comment.mjs <result.json> --tier cheap|strong --push <n>
 //     --gate pass|blocked [--prev <file with the previous comment body>]
+//     [--passes <n>] [--quiet]
 //
 // Prints the comment MARKDOWN to stdout. The driver (action.yml) UPSERTS it:
 // it finds the existing PR comment via the marker line, updates it in place,
@@ -20,6 +21,12 @@
 //           "Δ vs previous push" column appears only when --prev carries a
 //           parseable state line), a tier-state line, and a gate line.
 //
+// Mode notes: `--passes <n>` (default 1) adds "exhaustive: N passes" after
+// the tier line when N > 1 — the exhaustive loop made extra engine passes for
+// this result; `--quiet` adds "quiet mode: P2 shown in summary only" — the
+// driver muted inline P2 comments, so this table is where P2s live. Neither
+// note touches the machine-state line.
+//
 // Severity counts use the shared severity.mjs (leading tag, untagged->P1
 // fail-safe) — the same numbers the gate and the run report see. The gate
 // line's blocking COUNT assumes the default block-on set (P0+P1); the
@@ -34,26 +41,32 @@ const STATE_RE = /<!-- orca-cr-state: (\{.*?\}) -->/;
 
 const usage = () => {
   console.error(
-    "usage: node summary-comment.mjs <result.json> --tier cheap|strong --push <n> --gate pass|blocked [--prev <file>]",
+    "usage: node summary-comment.mjs <result.json> --tier cheap|strong --push <n> " +
+      "--gate pass|blocked [--prev <file>] [--passes <n>] [--quiet]",
   );
   process.exit(2);
 };
 
 const [file, ...rest] = process.argv.slice(2);
-const opts = {};
+const opts = { passes: "1" };
 for (let i = 0; i < rest.length; i += 1) {
   if (rest[i] === "--tier") opts.tier = rest[++i];
   else if (rest[i] === "--push") opts.push = rest[++i];
   else if (rest[i] === "--gate") opts.gate = rest[++i];
   else if (rest[i] === "--prev") opts.prev = rest[++i];
+  else if (rest[i] === "--passes") opts.passes = rest[++i];
+  else if (rest[i] === "--quiet") opts.quiet = true;
 }
 const push = Number(opts.push);
+const passes = Number(opts.passes);
 if (
   !file ||
   !["cheap", "strong"].includes(opts.tier) ||
   !["pass", "blocked"].includes(opts.gate) ||
   !Number.isInteger(push) ||
-  push < 1
+  push < 1 ||
+  !Number.isInteger(passes) ||
+  passes < 1
 ) {
   usage();
 }
@@ -105,6 +118,9 @@ if (opts.tier === "strong") {
 } else {
   lines.push("Tier: escalating to STRONG this run");
 }
+// Mode notes ride in the same status block as the tier line.
+if (passes > 1) lines.push(`exhaustive: ${passes} passes`);
+if (opts.quiet) lines.push("quiet mode: P2 shown in summary only");
 lines.push("");
 
 const blocking = counts.P0 + counts.P1;
