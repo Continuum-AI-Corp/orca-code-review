@@ -29,7 +29,10 @@ merge.
    (see rubric below). The tag mandate is layered onto OCR's built-in
    language/security review via `--background` (it adds to, never replaces,
    those checks) using `rules/severity-instruction.md`.
-3. **Inline comments** — findings post on the exact lines of the PR.
+3. **Inline comments + one summary** — findings post on the exact lines of the
+   PR, and a single summary comment — severity counts with a Δ against the
+   previous push, the current tier, and the gate verdict — is edited in place
+   on every push instead of adding a new comment each time.
 4. **Merge gate** — the job fails if any **P0/P1** is found; mark the check
    "required" in branch protection to block the merge.
 5. **Per-commit loop** — `synchronize` re-reviews on every new push; comment
@@ -124,6 +127,9 @@ All optional — pass as `with:` inputs on the action:
 | `router` | `orcarouter/code-review` | OrcaRouter router alias whose DSL recipe picks the cheap/strong model per tier (the action names no models) |
 | `fix-first` | `P0,P1` | Keep the PR on the cheap tier until these are cleared (then it's promoted) |
 | `block-on` | `P0,P1` | Fail the check (block merge) on one of these |
+| `max-diff-kb` | `512` | Skip the review when the merge-base diff is bigger than this many KB — a skip posts a notice and **passes** the check (never blocks a merge) without running the engine |
+| `max-diff-files` | `300` | Skip the review (same pass-with-notice behavior) when the diff touches more than this many files |
+| `report` | `true` | Send a per-run summary (severity counts only — never code) to the OrcaRouter control plane; set `"false"` to disable — see [Run reporting](#run-reporting) |
 
 ## Severity rubric
 
@@ -135,6 +141,17 @@ All optional — pass as `with:` inputs on the action:
 
 The rubric lives in `rules/severity-instruction.md` — edit it to retune what
 counts as P0/P1/P2 for your codebase.
+
+## Run reporting
+
+After each review pass the action POSTs a small run summary to your OrcaRouter
+control plane (`<gateway origin>/api/code_review/report`, authenticated with
+your API key): repo name, PR number, head SHA, tier (`cheap`/`strong`),
+P0/P1/P2 counts, gate result, and engine version. **That's the whole payload —
+no code, no diff, no finding text is ever sent.** (The diff itself only ever
+goes to the model through the gateway, exactly as before.) Reporting is
+best-effort — a control-plane outage can never fail the review — and can be
+turned off entirely with `report: "false"`.
 
 ## Making it block merges (optional)
 

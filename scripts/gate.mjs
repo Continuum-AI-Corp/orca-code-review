@@ -15,6 +15,7 @@
 // stderr for the CI log.
 
 import fs from "node:fs";
+import { severityOf } from "./severity.mjs";
 
 const [file, flag, listRaw] = process.argv.slice(2);
 
@@ -40,13 +41,9 @@ try {
   process.exit(1);
 }
 
-const severityOf = (c) => {
-  // Only honor the tag when it is the leading text. A `[P2]` mentioned later in
-  // prose or a code example must not override the missing-tag P1 fail-safe,
-  // otherwise an untagged finding could promote a PR and slip past P0/P1 gating.
-  const m = String(c?.content || "").match(/^\s*\[(P[012])\]/i);
-  return m ? m[1].toUpperCase() : "P1";
-};
+// Severity comes from the shared severity.mjs (leading-tag-only parsing plus
+// the untagged->P1 fail-safe) so the gate, the control-plane run report
+// (report.mjs), and the PR summary comment can never drift apart.
 
 const counts = {};
 let matched = false;

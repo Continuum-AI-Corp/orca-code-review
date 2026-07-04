@@ -17,6 +17,13 @@
 # headers, so an in-job loopback proxy (scripts/fact-proxy.mjs) stamps those
 # facts onto OCR's requests; the workspace router's DSL recipe
 # (recipes/code-review.dsl.yaml) maps them to the concrete cheap/strong model.
+#
+# Around the cascade: an oversized-diff guard (scripts/diff-guard.mjs) decides
+# review/skip BEFORE the engine ever runs (a skip passes the check with a
+# notice — it never blocks a merge); one summary comment per PR
+# (scripts/summary-comment.mjs) is upserted in place on every push; and a
+# best-effort per-tier run report (scripts/report.mjs) posts severity counts —
+# never code — to the OrcaRouter control plane after the gate.
 
 name: "OrcaRouter Code Review"
 description: "AI PR review via the OrcaRouter gateway — cost-tiered cascade with a severity merge gate."
@@ -58,6 +65,24 @@ inputs:
     description: "Severities that fail the check (block the merge)."
     required: false
     default: "P0,P1"
+  max-diff-kb:
+    description: >-
+      Skip the review when the PR's merge-base diff is bigger than this many
+      KB. A skip posts a notice and PASSES the check (it never blocks a merge)
+      without running the engine.
+    required: false
+    default: "512"
+  max-diff-files:
+    description: "Skip the review when the diff touches more than this many files (same pass-with-notice behavior as max-diff-kb)."
+    required: false
+    default: "300"
+  report:
+    description: >-
+      Send a best-effort per-tier run summary (repo, PR number, head SHA, tier,
+      P0/P1/P2 counts, gate result, engine version — never code or finding
+      text) to the OrcaRouter control plane. Set "false" to disable.
+    required: false
+    default: "true"
   engine-version:
     description: "Pinned @alibaba-group/open-code-review version (the review engine). Bump deliberately after testing — the later steps parse its JSON output shape."
     required: false
@@ -124,7 +149,92 @@ runs:
       with:
         node-version: "20"
 
+    - name: Oversized-diff guard
+      id: guard
+      shell: bash
+      env:
+        BRAND: ${{ inputs.brand }}
+        BASE: origin/${{ steps.pr.outputs.base }}
+        HEAD: ${{ steps.pr.outputs.head_sha }}
+        GUARD: ${{ github.action_path }}/scripts/diff-guard.mjs
+        MAX_KB: ${{ inputs.max-diff-kb }}
+        MAX_FILES: ${{ inputs.max-diff-files }}
+        DIFF_FILE: ${{ runner.temp }}/pr.diff
+        GUARD_JSON: ${{ runner.temp }}/diff-guard.json
+      run: |
+        # Size-check the SAME range the engine reviews (merge-base diff),
+        # BEFORE anything is installed or run: an oversized PR should cost
+        # nothing. `--merge-base` needs git >= 2.30; fall back to the
+        # equivalent three-dot form, then fail OPEN (empty file -> "review")
+        # if no diff can be produced — a guard glitch must never kill the job.
+        git diff --merge-base "$BASE" "$HEAD" > "$DIFF_FILE" 2>/dev/null \
+          || git diff "$BASE...$HEAD" > "$DIFF_FILE" 2>/dev/null \
+          || { echo "::warning::$BRAND: diff generation failed — size guard failing open."; : > "$DIFF_FILE"; }
+        node "$GUARD" --diff "$DIFF_FILE" --max-kb "$MAX_KB" --max-files "$MAX_FILES" > "$GUARD_JSON"
+        cat "$GUARD_JSON"
+        node -e '
+          const fs = require("fs");
+          const g = JSON.parse(fs.readFileSync(process.env.GUARD_JSON, "utf8"));
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `decision=${g.decision}\nreason=${g.reason}\nsize_kb=${g.size_kb}\nfiles=${g.files}\n`,
+          );
+        '
+
+    # On "skip": explain on the PR (upserted — one notice, edited while pushes
+    # stay oversized), then PASS. No later step runs the engine or the gate, so
+    # the job (and a required check) goes green — a skip must not block merges.
+    - name: Skip review (diff too large)
+      if: steps.guard.outputs.decision == 'skip'
+      uses: actions/github-script@v7
+      env:
+        BRAND: ${{ inputs.brand }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+        SIZE_KB: ${{ steps.guard.outputs.size_kb }}
+        FILES: ${{ steps.guard.outputs.files }}
+        REASON: ${{ steps.guard.outputs.reason }}
+        MAX_KB: ${{ inputs.max-diff-kb }}
+        MAX_FILES: ${{ inputs.max-diff-files }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const brand = process.env.BRAND;
+          const num = Number(process.env.PR_NUMBER);
+          const repo = { owner: context.repo.owner, repo: context.repo.repo };
+          // Own marker (distinct from the summary comment's): once the PR
+          // shrinks and reviews resume, the summary comment takes over.
+          const MARKER = '<!-- orca-code-review-skip -->';
+          const footer =
+            `\n\n<sub>Reviewed via [OrcaRouter](https://orcarouter.ai) — ` +
+            `Route Smarter. Ship Safer. Spend Less.</sub>`;
+          const body =
+            `${MARKER}\n## 🐳 ${brand}\n\n` +
+            `⏭️ **Review skipped — this PR's diff is too large** (${process.env.REASON}).\n\n` +
+            `| | This PR | Limit |\n|---|---|---|\n` +
+            `| Diff size | ${process.env.SIZE_KB} KB | ${process.env.MAX_KB} KB |\n` +
+            `| Files touched | ${process.env.FILES} | ${process.env.MAX_FILES} |\n\n` +
+            `The review engine was **not** run — reviews of very large diffs truncate and ` +
+            `lose signal — and the check **passes**, so this never blocks your merge.\n\n` +
+            `**Want it reviewed anyway?** Raise the limits on the action:\n\n` +
+            '```yaml\nwith:\n  max-diff-kb: "1024"    # default 512\n  max-diff-files: "500"  # default 300\n```\n\n' +
+            `Or split the PR — smaller diffs get much higher-signal reviews.` +
+            footer;
+
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            ...repo, issue_number: num, per_page: 100,
+          });
+          const existing = comments.find((c) => c.body && c.body.includes(MARKER));
+          if (existing) {
+            await github.rest.issues.updateComment({ ...repo, comment_id: existing.id, body });
+          } else {
+            await github.rest.issues.createComment({ ...repo, issue_number: num, body });
+          }
+
+          await core.summary.addRaw(`skipped: diff too large (${process.env.REASON})`).write();
+          core.notice(`${brand}: review skipped — ${process.env.REASON}`);
+
     - name: Install review engine
+      if: steps.guard.outputs.decision != 'skip'
       shell: bash
       env:
         ENGINE_VERSION: ${{ inputs.engine-version }}
@@ -132,6 +242,7 @@ runs:
 
     - name: Review (stateful cost-tiered cascade)
       id: cascade
+      if: steps.guard.outputs.decision != 'skip'
       shell: bash
       env:
         TIER_STATE: ${{ steps.pr.outputs.tier }}
@@ -164,6 +275,10 @@ runs:
         # $RUNNER_TEMP is runner-controlled and reset per job.
         RESULT: ${{ runner.temp }}/result.json
         REVIEW_LOG: ${{ runner.temp }}/review.log
+        # Per-tier snapshots of $RESULT (which the escalation pass overwrites):
+        # the report steps below need each tier's own severity counts.
+        RESULT_CHEAP: ${{ runner.temp }}/result-cheap.json
+        RESULT_STRONG: ${{ runner.temp }}/result-strong.json
         FACTS_FILE: ${{ runner.temp }}/cr-facts.json
         # The proxy writes the guardrail/firewall reason here on a block; a later
         # always()-step posts it to the PR (the cascade itself fails closed).
@@ -236,18 +351,30 @@ runs:
         # before the PR can merge — and record the promotion so later pushes skip
         # the cheap pass. If the cheap tier still finds FIX_FIRST, hold the strong
         # tier until those are fixed.
+        # Each tier's result is snapshotted and its outcome written to
+        # $GITHUB_OUTPUT AS SOON as it is known (outputs written before a later
+        # failure still surface), so the per-tier report steps have each tier's
+        # own counts: `cheap_gate` (blocked|pass) doubles as "the cheap tier ran
+        # to a decision", `strong_ran` marks a completed strong pass.
         PROMOTE=false
         HELD=false
         if [ "$TIER_STATE" = "1" ]; then
           run_review "strong tier (promoted)" "strong" "false"
+          cp "$RESULT" "$RESULT_STRONG"
+          echo "strong_ran=true" >> "$GITHUB_OUTPUT"
         else
           run_review "cheap tier" "cheap" "true"
+          cp "$RESULT" "$RESULT_CHEAP"
           if node "$GATE" "$RESULT" --has "$FIX_FIRST"; then
             echo "Cheap tier found $FIX_FIRST — holding the strong tier until those are fixed."
+            echo "cheap_gate=blocked" >> "$GITHUB_OUTPUT"
             HELD=true
           else
             echo "Cheap tier clear of $FIX_FIRST — escalating to the strong tier now."
+            echo "cheap_gate=pass" >> "$GITHUB_OUTPUT"
             run_review "strong tier (escalation)" "cheap" "false"
+            cp "$RESULT" "$RESULT_STRONG"
+            echo "strong_ran=true" >> "$GITHUB_OUTPUT"
             PROMOTE=true
           fi
         fi
@@ -261,8 +388,10 @@ runs:
     # failed closed and the normal review comment never runs. Surface the reason
     # on the PR so the block is actionable, not just a red X with a log line.
     # always() so it posts despite the failed cascade; no-op when no block file.
+    # The guard condition also keeps a STALE block file from being posted on a
+    # skipped run (the cascade's own cleanup never ran on a skip).
     - name: Surface guardrail / firewall block
-      if: always()
+      if: always() && steps.guard.outputs.decision != 'skip'
       uses: actions/github-script@v7
       env:
         BRAND: ${{ inputs.brand }}
@@ -346,6 +475,7 @@ runs:
           core.info(`PR #${num} promoted to review tier 1 (strong model).`);
 
     - name: Post review comments
+      if: steps.guard.outputs.decision != 'skip'
       uses: actions/github-script@v7
       env:
         BRAND: ${{ inputs.brand }}
@@ -377,10 +507,9 @@ runs:
             `Route Smarter. Ship Safer. Spend Less.</sub>`;
 
           if (comments.length === 0) {
-            await github.rest.issues.createComment({
-              ...repo, issue_number: num,
-              body: `## 🐳 ${brand}\n\nNo issues found. ✅${footer}`,
-            });
+            // Clean run: no separate notice — the upserted summary comment
+            // (next step) already reports the clean state without adding a
+            // new timeline entry on every push.
             return;
           }
 
@@ -462,7 +591,71 @@ runs:
             await github.rest.issues.createComment({ ...repo, issue_number: num, body: fallback + footer });
           }
 
+    # ONE summary comment per PR, upserted by marker and edited in place on
+    # every push: severity counts with Δ vs the previous push (state travels
+    # in an HTML comment inside the body), the tier, and the gate verdict.
+    # Runs BEFORE the enforce step so a blocked run still updates the summary.
+    - name: Summary comment (upsert)
+      if: steps.guard.outputs.decision != 'skip'
+      uses: actions/github-script@v7
+      env:
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+        RESULT: ${{ runner.temp }}/result.json
+        PREV_BODY: ${{ runner.temp }}/prev-summary.md
+        SUMMARY_SCRIPT: ${{ github.action_path }}/scripts/summary-comment.mjs
+        GATE: ${{ github.action_path }}/scripts/gate.mjs
+        BLOCK_ON: ${{ inputs.block-on }}
+        HELD: ${{ steps.cascade.outputs.held }}
+        STRONG_RAN: ${{ steps.cascade.outputs.strong_ran }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          const { execFileSync } = require('child_process');
+          const num = Number(process.env.PR_NUMBER);
+          const repo = { owner: context.repo.owner, repo: context.repo.repo };
+          // Keep in sync with scripts/summary-comment.mjs.
+          const MARKER = '<!-- orca-code-review-summary -->';
+
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            ...repo, issue_number: num, per_page: 100,
+          });
+          const existing = comments.find((c) => c.body && c.body.includes(MARKER));
+
+          // Feed the previous body back for the Δ column and number this push
+          // from its machine state (first summary = push 1).
+          const args = [process.env.SUMMARY_SCRIPT, process.env.RESULT];
+          let push = 1;
+          if (existing) {
+            fs.writeFileSync(process.env.PREV_BODY, existing.body);
+            args.push('--prev', process.env.PREV_BODY);
+            const m = existing.body.match(/<!-- orca-cr-state: (\{.*?\}) -->/);
+            if (m) {
+              try { push = (Number(JSON.parse(m[1]).push) || 0) + 1; } catch { /* keep 1 */ }
+            }
+          }
+
+          // Mirror the enforce step's verdict: held blocks; otherwise gate.mjs
+          // on the final result (exit 0 = a BLOCK_ON severity is present).
+          let blocked = process.env.HELD === 'true';
+          if (!blocked) {
+            try {
+              execFileSync('node', [process.env.GATE, process.env.RESULT, '--has', process.env.BLOCK_ON], { stdio: 'pipe' });
+              blocked = true;
+            } catch { blocked = false; }
+          }
+          const tier = process.env.STRONG_RAN === 'true' ? 'strong' : 'cheap';
+          args.push('--tier', tier, '--push', String(push), '--gate', blocked ? 'blocked' : 'pass');
+
+          const body = execFileSync('node', args, { encoding: 'utf8' });
+          if (existing) {
+            await github.rest.issues.updateComment({ ...repo, comment_id: existing.id, body });
+          } else {
+            await github.rest.issues.createComment({ ...repo, issue_number: num, body });
+          }
+
     - name: Enforce severity gate
+      if: steps.guard.outputs.decision != 'skip'
       shell: bash
       env:
         BRAND: ${{ inputs.brand }}
@@ -482,6 +675,57 @@ runs:
         fi
         echo "$BRAND: no $BLOCK_ON findings — gate passed."
 
+    # Best-effort run counters to the OrcaRouter control plane — severity
+    # counts and the gate verdict only, never code (see README "Run
+    # reporting"). One step per tier that ran, AFTER the gate: always() because
+    # a blocked gate fails the job above, and blocked runs must report too.
+    # report.mjs itself exits 0 on any error, so these steps can't fail the job.
+    - name: Report run (cheap tier)
+      # `cheap_gate` doubles as "the cheap tier ran to a gate decision".
+      if: always() && inputs.report == 'true' && steps.cascade.outputs.cheap_gate != ''
+      shell: bash
+      env:
+        REPORT: ${{ github.action_path }}/scripts/report.mjs
+        RESULT_CHEAP: ${{ runner.temp }}/result-cheap.json
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+        HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        CHEAP_GATE: ${{ steps.cascade.outputs.cheap_gate }}
+        ORCAROUTER_URL: ${{ inputs.orcarouter-url }}
+        ORCAROUTER_API_KEY: ${{ inputs.orcarouter-api-key }}
+        ENGINE_VERSION: ${{ inputs.engine-version }}
+      run: |
+        node "$REPORT" "$RESULT_CHEAP" \
+          --repo "$REPO" --pr "$PR_NUMBER" --sha "$HEAD_SHA" \
+          --tier cheap --gate "$CHEAP_GATE" \
+          --url "$ORCAROUTER_URL" --key "$ORCAROUTER_API_KEY" \
+          --engine-version "$ENGINE_VERSION"
+
+    - name: Report run (strong tier)
+      if: always() && inputs.report == 'true' && steps.cascade.outputs.strong_ran == 'true'
+      shell: bash
+      env:
+        REPORT: ${{ github.action_path }}/scripts/report.mjs
+        GATE: ${{ github.action_path }}/scripts/gate.mjs
+        RESULT_STRONG: ${{ runner.temp }}/result-strong.json
+        BLOCK_ON: ${{ inputs.block-on }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+        HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        ORCAROUTER_URL: ${{ inputs.orcarouter-url }}
+        ORCAROUTER_API_KEY: ${{ inputs.orcarouter-api-key }}
+        ENGINE_VERSION: ${{ inputs.engine-version }}
+      run: |
+        # The strong tier's verdict re-uses gate.mjs on its snapshot
+        # (exit 0 = a BLOCK_ON severity is present = blocked).
+        GATE_RESULT=pass
+        if node "$GATE" "$RESULT_STRONG" --has "$BLOCK_ON"; then GATE_RESULT=blocked; fi
+        node "$REPORT" "$RESULT_STRONG" \
+          --repo "$REPO" --pr "$PR_NUMBER" --sha "$HEAD_SHA" \
+          --tier strong --gate "$GATE_RESULT" \
+          --url "$ORCAROUTER_URL" --key "$ORCAROUTER_API_KEY" \
+          --engine-version "$ENGINE_VERSION"
+
     - name: Clean up engine output
       if: always()
       shell: bash
@@ -492,5 +736,7 @@ runs:
         # settings come from env vars), and deleting it would corrupt the OCR
         # state of other jobs/users on the same runner.
         rm -f "$RUNNER_TEMP/result.json" "$RUNNER_TEMP/review.log" \
+          "$RUNNER_TEMP/result-cheap.json" "$RUNNER_TEMP/result-strong.json" \
           "$RUNNER_TEMP/cr-facts.json" "$RUNNER_TEMP/proxy.out" "$RUNNER_TEMP/proxy.err" \
-          "$RUNNER_TEMP/policy-block.json"
+          "$RUNNER_TEMP/policy-block.json" \
+          "$RUNNER_TEMP/pr.diff" "$RUNNER_TEMP/diff-guard.json" "$RUNNER_TEMP/prev-summary.md"
