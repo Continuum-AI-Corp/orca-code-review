@@ -452,6 +452,121 @@ describe("idempotency: only provably-unprocessed connection errors retry", () =>
   });
 });
 
+describe("upstream timeout (black-hole gateway must fail fast, not hang)", () => {
+  test("upstream accepts then never responds -> proxy faults fast (502) instead of hanging", async () => {
+    // Accept the connection, consume the body, then go silent forever.
+    const held = [];
+    const blackhole = http.createServer((req, res) => {
+      req.resume();
+      held.push(res); // keep a ref so it is never garbage-collected / closed
+    });
+    const blackholePort = await listen(blackhole);
+    const sleep = fakeSleep();
+    const proxy = await startProxy({
+      upstreamUrl: `http://127.0.0.1:${blackholePort}/v1/chat/completions`,
+      sleep: sleep.fn,
+      upstreamTimeoutMs: 250, // tiny cap: the fault must land well under capMs
+    });
+    try {
+      // capMs (2s) >> the 250ms upstream timeout: a fixed proxy answers fast;
+      // a hanging (unfixed) proxy would trip timedOut here.
+      const outcome = await requestOutcome(proxy.port, { body: '{"model":"m"}' }, 2000);
+      assert.equal(outcome.timedOut, false, "a black-hole upstream must fault fast, not hang the client");
+      assert.equal(outcome.status, 502, "a post-send timeout with no response is surfaced as 502");
+    } finally {
+      for (const res of held) res.destroy();
+      await proxy.close();
+      await new Promise((r) => blackhole.close(r));
+    }
+  });
+});
+
+describe("client disconnect (OCR hangs up mid-relay)", () => {
+  test("client aborts mid-relay: the in-flight upstream request is cancelled, and the proxy survives to serve the next request", async () => {
+    let hits = 0;
+    let firstUpstreamCut = false;
+    const upstream = http.createServer((sreq, sres) => {
+      hits += 1;
+      if (hits === 1) {
+        // Start relaying, then stall — the client aborts during the stream.
+        sres.writeHead(200, { "content-type": "text/event-stream" });
+        sres.write("data: partial\n\n");
+        // If the proxy cancels the orphaned upstream call, THIS socket is cut
+        // before it ever ends — that is the leak the fix must prevent.
+        sres.on("close", () => {
+          if (!sres.writableEnded) firstUpstreamCut = true;
+        });
+        // deliberately never end
+      } else {
+        sres.writeHead(200);
+        sres.end("ok");
+      }
+    });
+    const upstreamPort = await listen(upstream);
+    const sleep = fakeSleep();
+    const proxy = await startProxy({
+      upstreamUrl: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+      sleep: sleep.fn,
+    });
+    try {
+      // Fire a client request and abort it as soon as the relayed bytes arrive.
+      await new Promise((resolve) => {
+        const creq = http.request(
+          { host: "127.0.0.1", port: proxy.port, path: "/v1/chat/completions", method: "POST" },
+          (cres) => {
+            cres.on("data", () => {
+              creq.destroy(); // OCR hangs up mid-stream
+              resolve();
+            });
+            cres.on("error", () => {});
+          },
+        );
+        creq.on("error", () => {});
+        creq.end("{}");
+      });
+      await settle(200); // let 'close' propagate and cancel the upstream call
+      assert.equal(firstUpstreamCut, true, "an OCR disconnect must cancel the still-billing upstream request");
+      assert.deepEqual(sleep.calls, [], "a disconnect must not schedule a retry");
+      // The proxy itself must still be alive and serving.
+      const again = await request(proxy.port, { body: "{}" });
+      assert.equal(again.status, 200);
+      assert.equal(again.body, "ok");
+      assert.equal(hits, 2, "the follow-up request reached upstream as a fresh call");
+    } finally {
+      await proxy.close();
+      await new Promise((r) => upstream.close(r));
+    }
+  });
+
+  test("the CLI installs a process-level uncaughtException backstop that does not exit", () => {
+    const src = readFileSync(PROXY_SCRIPT, "utf8");
+    const cli = src.slice(src.indexOf("CLI entry"));
+    assert.match(cli, /process\.on\(\s*["']uncaughtException["']/, "the proxy CLI must install an uncaughtException backstop");
+    assert.doesNotMatch(cli, /uncaughtException[\s\S]*?process\.exit/, "the backstop must NOT exit — one bad client can't take the proxy down");
+  });
+});
+
+describe("action.yml wiring (guardrail / firewall block comment)", () => {
+  const actionYml = () => readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "action.yml"), "utf8");
+
+  test("the block comment is upserted by its own marker (not a new comment on every push)", () => {
+    const yml = actionYml();
+    const step = yml.slice(
+      yml.indexOf("- name: Surface guardrail / firewall block"),
+      yml.indexOf("- name: Promote tier"),
+    );
+    assert.match(step, /<!-- orca-code-review-block -->/, "the block comment needs an upsert marker");
+    assert.match(step, /listComments/, "it must look for an existing block comment");
+    assert.match(step, /updateComment/, "and edit it in place instead of piling up new ones");
+  });
+
+  test("a resumed clean review retires the stale block comment", () => {
+    const yml = actionYml();
+    const summary = yml.slice(yml.indexOf("- name: Summary comment"), yml.indexOf("- name: Enforce severity gate"));
+    assert.match(summary, /orca-code-review-block/, "the summary step must delete a stale block comment once reviews resume");
+  });
+});
+
 describe("CLI contract (unchanged by the retry refactor)", () => {
   test("`node fact-proxy.mjs` reads env vars, prints PROXY_URL=…, and proxies", async () => {
     const upstream = await startUpstream([

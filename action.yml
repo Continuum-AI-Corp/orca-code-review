@@ -286,6 +286,22 @@ runs:
         # `/orcarouter-review` comment command (issue_comment) always proceeds —
         # on-demand mode exists precisely for those, and a human asking for a
         # review of a draft/disabled repo is deliberate.
+        # Spend guard for public repos: only auto-review PRs whose author
+        # association is in the allowlist. Factored into a function so it is
+        # unit-tested directly (settings.test.mjs extracts and runs this exact
+        # code). Both sides are space-trimmed the way the JS list parsers are,
+        # so "OWNER, MEMBER" still anchors on ",MEMBER,"; the comma wrapping
+        # keeps the match a whole-token one (MEMBER never matches inside
+        # FIRST_TIME_CONTRIBUTOR). An empty (or all-space) allowlist allows
+        # everyone (default, preserves behavior). echoes allow|deny.
+        author_allowed() {
+          local list assoc
+          list=$(printf '%s' "$1" | tr -d ' ')
+          assoc=$(printf '%s' "$2" | tr -d ' ')
+          if [ -z "$list" ]; then echo allow; return; fi
+          if printf '%s' ",$list," | grep -qi ",$assoc,"; then echo allow; else echo deny; fi
+        }
+
         DECISION=review
         REASON=""
         case "$EVENT_NAME" in
@@ -296,12 +312,8 @@ runs:
               DECISION=skip; REASON="on-demand mode"
             elif [ "$TRIGGER" = "ready_for_review" ] && [ "$IS_DRAFT" = "true" ]; then
               DECISION=skip; REASON="draft PR"
-            elif [ -n "$AUTO_REVIEW_AUTHORS" ] && \
-                 ! printf '%s' ",$AUTO_REVIEW_AUTHORS," | grep -qi ",$AUTHOR_ASSOC,"; then
-              # Spend guard for public repos: only auto-review PRs whose author
-              # association is in the allowlist. Empty allowlist = review
-              # everyone (default, preserves behavior). Maintainer comment
-              # commands are unaffected (gated in the workflow `if:`).
+            elif [ "$(author_allowed "$AUTO_REVIEW_AUTHORS" "$AUTHOR_ASSOC")" = deny ]; then
+              # Maintainer comment commands are unaffected (gated in the workflow `if:`).
               DECISION=skip; REASON="author association $AUTHOR_ASSOC not in auto-review-authors"
             fi
             ;;
@@ -653,10 +665,21 @@ runs:
               echo "::warning::$BRAND: exhaustive pass $extra produced no usable result — keeping the findings so far."
               break
             fi
-            MERGE_OUT=$(node "$MERGE" --base "$RESULT" --new "$RESULT_EXTRA" --out "$RESULT_MERGED")
+            # Guard the merge + parse like the run_pass failure path above: an
+            # exhaustive-merge.mjs crash or unparseable output must NOT abort the
+            # whole step under `set -e` (that would skip Post/Summary/Enforce and
+            # turn a review with valid findings-in-hand red). On any failure,
+            # warn and END exhaustion gracefully, keeping the findings so far.
+            if ! MERGE_OUT=$(node "$MERGE" --base "$RESULT" --new "$RESULT_EXTRA" --out "$RESULT_MERGED"); then
+              echo "::warning::$BRAND: exhaustive pass $extra merge failed — keeping the findings so far."
+              break
+            fi
             mv "$RESULT_MERGED" "$RESULT"
             PASSES=$extra
-            NEW_FINDINGS=$(MERGE_JSON="$MERGE_OUT" node -pe 'JSON.parse(process.env.MERGE_JSON).new_findings')
+            if ! NEW_FINDINGS=$(MERGE_JSON="$MERGE_OUT" node -pe 'JSON.parse(process.env.MERGE_JSON).new_findings'); then
+              echo "::warning::$BRAND: exhaustive pass $extra produced unparseable merge output — keeping the findings so far."
+              break
+            fi
             echo "exhaustive: pass $extra added $NEW_FINDINGS new finding(s)."
             [ "$NEW_FINDINGS" -gt 0 ] || break
           done
@@ -733,6 +756,11 @@ runs:
           const brand = process.env.BRAND;
           const num = Number(process.env.PR_NUMBER);
           const repo = { owner: context.repo.owner, repo: context.repo.repo };
+          // Own marker (distinct from the summary/skip/disabled ones): the block
+          // is upserted so a PR that trips a guardrail on every push gets ONE
+          // edited comment, not a fresh one each time; the summary step retires
+          // it once a clean review posts.
+          const MARKER = '<!-- orca-code-review-block -->';
           const layer = block.kind === 'firewall' ? 'firewall' : 'guardrail';
           const policyLine = block.policyName
             ? `\n\n**Policy:** \`${String(block.policyName).slice(0, 120)}\``
@@ -746,7 +774,7 @@ runs:
             `\n\n<sub>Reviewed via [OrcaRouter](https://orcarouter.ai) — ` +
             `Route Smarter. Ship Safer. Spend Less.${idTag}</sub>`;
           const body =
-            `## 🐳 ${brand}\n\n` +
+            `${MARKER}\n## 🐳 ${brand}\n\n` +
             `🛡️ **Review blocked by a ${layer} policy.**` +
             policyLine +
             matchedLine +
@@ -759,7 +787,18 @@ runs:
             `- If a real secret was exposed, rotate it now.\n` +
             `- Push the fix and the review will re-run automatically.` +
             footer;
-          await github.rest.issues.createComment({ ...repo, issue_number: num, body });
+          // Upsert by marker — find an existing block comment and edit it (only
+          // when the reason changed), else create one, mirroring the skip-notice
+          // pattern above. A guardrail that trips on every push must not spam.
+          const existingComments = await github.paginate(github.rest.issues.listComments, {
+            ...repo, issue_number: num, per_page: 100,
+          });
+          const existing = existingComments.find((c) => c.body && c.body.includes(MARKER));
+          if (!existing) {
+            await github.rest.issues.createComment({ ...repo, issue_number: num, body });
+          } else if (existing.body !== body) {
+            await github.rest.issues.updateComment({ ...repo, comment_id: existing.id, body });
+          }
 
     - name: Promote tier
       if: steps.cascade.outputs.promote == 'true'
@@ -951,6 +990,8 @@ runs:
         SUMMARY_SCRIPT: ${{ github.action_path }}/scripts/summary-comment.mjs
         GATE: ${{ github.action_path }}/scripts/gate.mjs
         BLOCK_ON: ${{ steps.settings.outputs.block_on }}
+        # Fix-first set — the ❌ count is taken over THIS (not block-on) on a held run.
+        FIX_FIRST: ${{ steps.settings.outputs.fix_first }}
         HELD: ${{ steps.cascade.outputs.held }}
         STRONG_RAN: ${{ steps.cascade.outputs.strong_ran }}
         QUIET: ${{ steps.settings.outputs.quiet }}
@@ -970,10 +1011,11 @@ runs:
           });
           const existing = comments.find((c) => c.body && c.body.includes(MARKER));
 
-          // A real review ran, so retire stale skip notices (best-effort): the
-          // "automatic review is off" and "diff too large" comments would
-          // otherwise outlive the condition they describe once reviews resume.
-          for (const stale of ['<!-- orca-code-review-disabled -->', '<!-- orca-code-review-skip -->']) {
+          // A real review ran, so retire stale notices (best-effort): the
+          // "automatic review is off", "diff too large", and guardrail/firewall
+          // "review blocked" comments would otherwise outlive the condition they
+          // describe once a clean review posts.
+          for (const stale of ['<!-- orca-code-review-disabled -->', '<!-- orca-code-review-skip -->', '<!-- orca-code-review-block -->']) {
             const notice = comments.find((c) => c.body && c.body.includes(stale));
             if (!notice) continue;
             try {
@@ -1011,6 +1053,14 @@ runs:
           // (dashboard/input precedence already applied) — an empty string is
           // a deliberate "block on nothing" and passes through as-is.
           args.push('--block-on', process.env.BLOCK_ON ?? 'P0,P1');
+          // Held run (cheap tier withheld escalation on fix-first findings): the
+          // ❌ count must reflect the FIX-FIRST set, not block-on — block-on may
+          // not include those severities (a repo can even set block_on=''), and
+          // counting over it would render "❌ 0 findings block merge" next to the
+          // held tier line. --held switches the count to fix-first.
+          if (process.env.HELD === 'true') {
+            args.push('--held', '--fix-first', process.env.FIX_FIRST ?? 'P0,P1');
+          }
           // Mode notes: exhaustive pass count (renders only when > 1) and the
           // quiet-mode explainer next to the true counts.
           args.push('--passes', process.env.PASSES || '1');

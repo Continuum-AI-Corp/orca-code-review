@@ -2,8 +2,9 @@
 // Best-effort run report to the OrcaRouter control plane.
 //
 //   node report.mjs <result.json> --repo <owner/name> --pr <n> --sha <sha>
-//     --tier cheap|strong --gate pass|blocked --url <orcarouter-url> --key <api-key>
+//     --tier cheap|strong --gate pass|blocked --url <orcarouter-url>
 //     [--engine-version <v>]
+//   (the API key comes from ORCAROUTER_API_KEY in the env, never a flag)
 //
 // POSTs {repo, pr_number, head_sha, tier, p0, p1, p2, gate_result[,
 // engine_version]} to <origin of --url>/api/code_review/report (the /v1/…

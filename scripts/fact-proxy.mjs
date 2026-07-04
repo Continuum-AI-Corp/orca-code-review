@@ -39,9 +39,26 @@
 // connection error). Every response carries x-cr-retry-count (retries actually
 // performed) for observability.
 //
+// Timeout: each upstream attempt is capped (default 120s, CR_UPSTREAM_TIMEOUT_MS
+// / the upstreamTimeoutMs opt override it) so a black-hole gateway (accepts the
+// TCP connection, never answers) fails fast into the SAME error handler instead
+// of hanging until OCR's own timeout. A pre-response timeout is classified like
+// any pre-send connection error (retried only if the body hadn't finished
+// flushing — replay stays idempotency-safe); a timeout after the relay started
+// tears the client stream down and never retries.
+//
+// Resilience: the client (OCR) can vanish at any time. A 'close' before the
+// response finished cancels the in-flight upstream request (an OCR disconnect
+// must not leak a still-billing completion) and blocks any pending retry from
+// dialing again; a client-side 'error' is caught (a write to a dead socket must
+// not throw an unhandled EPIPE); and the CLI installs a process-level
+// uncaughtException backstop that logs and keeps serving — one bad client can
+// never take the proxy down mid-job.
+//
 // Env:
-//   ORCAROUTER_URL  full upstream chat-completions URL (origin + path forwarded)
-//   CR_FACTS_FILE   path to the JSON facts file the driver rewrites per pass
+//   ORCAROUTER_URL          full upstream chat-completions URL (origin + path forwarded)
+//   CR_FACTS_FILE           path to the JSON facts file the driver rewrites per pass
+//   CR_UPSTREAM_TIMEOUT_MS  optional per-attempt upstream timeout (ms; default 120000)
 // On listen it prints `PROXY_URL=http://127.0.0.1:<port><upstream-path>` to
 // stdout; the driver sets OCR_LLM_URL to that. Auth is forwarded untouched and
 // never logged.
@@ -69,6 +86,10 @@ const RETRY_AFTER_CAP_MS = 30_000;
 // buffering arbitrarily large bodies for replay would unbound the proxy's
 // memory on a shared runner.
 const MAX_RETRY_BUFFER_BYTES = 8 * 1024 * 1024;
+// A gateway that accepts the connection but never responds (a black hole) must
+// not hang the whole job — cap each upstream attempt and let the error handler
+// classify the timeout like any other pre/post-response failure.
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 120_000;
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // A guardrail (content policy) or firewall (tool-call policy) block arrives as
@@ -149,6 +170,7 @@ export function createProxyServer({
   sleep = defaultSleep,
   maxRetries = 3,
   maxBufferBytes = MAX_RETRY_BUFFER_BYTES,
+  upstreamTimeoutMs = DEFAULT_UPSTREAM_TIMEOUT_MS,
 } = {}) {
   const upstream = new URL(upstreamUrl);
   const upstreamLib = upstream.protocol === "http:" ? http : https;
@@ -159,10 +181,38 @@ export function createProxyServer({
     Object.assign(headers, readFacts(factsFile));
     const target = new URL(req.url, upstream);
 
+    // The upstream request currently in flight for THIS client request (the
+    // buffered attempt or the streaming variant), so a client disconnect can
+    // cancel it. `clientGone` latches that disconnect so no scheduled retry
+    // dials upstream again once OCR has hung up.
+    let activeUpReq = null;
+    let clientGone = false;
+
+    // The client (OCR) socket can die at any moment. Without an 'error' sink a
+    // write to a half-open socket throws an unhandled EPIPE/ECONNRESET and
+    // would crash the whole proxy — log and drop instead.
+    res.on("error", (e) => {
+      console.error(`fact-proxy: client connection error (${e.message}) — dropping`);
+      res.destroy();
+    });
+    // OCR hung up before we finished answering: the upstream call is now
+    // orphaned. Cancel it so a disconnect can't leak a still-billing
+    // completion, and stop any pending retry from starting a fresh one. A
+    // normal completion also fires 'close', but with writableEnded already set
+    // (nothing left in flight), so it is a no-op.
+    res.on("close", () => {
+      if (res.writableEnded) return;
+      clientGone = true;
+      if (activeUpReq && !activeUpReq.destroyed) {
+        activeUpReq.destroy(new Error("client disconnected"));
+      }
+    });
+
     // Terminal failure for one client request. Before the relay: answer 502.
     // After it: the headers are out, so destroy the connection — a truncated
     // stream must error out fast, not leave OCR waiting until the job timeout.
     const failResponse = (retries) => {
+      if (clientGone || res.writableEnded) return; // client already gone — nobody to answer
       if (res.headersSent) {
         res.destroy();
         return;
@@ -188,6 +238,7 @@ export function createProxyServer({
         upRes.on("end", () => {
           const buf = Buffer.concat(parts);
           recordPolicyBlock(buf, policyBlockFile);
+          if (clientGone || res.writableEnded) return; // client left during the 400 buffer — nobody to answer
           res.writeHead(status, outHeaders);
           res.end(buf);
         });
@@ -224,7 +275,7 @@ export function createProxyServer({
     // status path already scheduled a retry, and without the latch that would
     // start a second parallel retry chain (two relays -> double writeHead).
     const attempt = (body, retries) => {
-      if (res.destroyed) return; // client gave up — nobody left to answer
+      if (clientGone || res.destroyed) return; // client gave up — nobody left to answer
       let settled = false;
       const settleThisAttempt = () => {
         if (settled) return false;
@@ -260,6 +311,15 @@ export function createProxyServer({
           relay(upRes, status, retries);
         },
       );
+      activeUpReq = upReq;
+      // Fail fast on a black-hole gateway: destroying the request routes the
+      // timeout through the SAME upReq 'error' handler below, so a pre-response
+      // timeout is classified exactly like a pre-send connection error (retried
+      // only when the body hadn't finished flushing — replay stays idempotent-
+      // safe) and a post-relay timeout tears the stream down without retrying.
+      upReq.setTimeout(upstreamTimeoutMs, () => {
+        upReq.destroy(new Error(`upstream timeout after ${upstreamTimeoutMs}ms`));
+      });
       upReq.on("error", (e) => {
         if (!settleThisAttempt()) {
           // This attempt's outcome is already owned elsewhere. If it was owned
@@ -318,11 +378,17 @@ export function createProxyServer({
           relay(upRes, upRes.statusCode || 502, 0);
         },
       );
+      // Same black-hole guard as the buffered path; a streamed body can't be
+      // replayed, so any error (incl. this timeout) fails closed, never retries.
+      upReq.setTimeout(upstreamTimeoutMs, () => {
+        upReq.destroy(new Error(`upstream timeout after ${upstreamTimeoutMs}ms`));
+      });
       upReq.on("error", (e) => {
         console.error(`fact-proxy: upstream error (streamed body is unreplayable — not retried): ${e.message}`);
         failResponse(0);
       });
       streamReq = upReq;
+      activeUpReq = upReq;
       for (const c of chunks) upReq.write(c);
       chunks.length = 0;
       req.pipe(upReq); // pipe ends upReq when the client body ends
@@ -353,13 +419,24 @@ export function createProxyServer({
 
 // ---- CLI entry (contract unchanged): env-driven, prints PROXY_URL on listen.
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // Backstop: one misbehaving client (a mid-write EPIPE, a socket destroyed
+  // under us) must NEVER take the whole proxy down mid-job — every request
+  // already fails closed on its own path. Log and keep serving; do NOT exit.
+  // Registered only for the real proxy process, so importing the factory into
+  // tests never masks their uncaught errors.
+  process.on("uncaughtException", (e) => {
+    console.error(`fact-proxy: uncaught exception (kept alive): ${e && e.stack ? e.stack : e}`);
+  });
+
   const upstream = new URL(
     process.env.ORCAROUTER_URL || "https://api.orcarouter.ai/v1/chat/completions",
   );
+  const envTimeout = Number(process.env.CR_UPSTREAM_TIMEOUT_MS);
   const server = createProxyServer({
     upstreamUrl: upstream.href,
     factsFile: process.env.CR_FACTS_FILE || "",
     policyBlockFile: process.env.CR_POLICY_BLOCK_FILE || "",
+    ...(Number.isFinite(envTimeout) && envTimeout > 0 ? { upstreamTimeoutMs: envTimeout } : {}),
   });
   server.listen(0, "127.0.0.1", () => {
     const { port } = server.address();

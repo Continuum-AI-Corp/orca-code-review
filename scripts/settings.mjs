@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Dashboard settings fetch for the OrcaRouter Code Review cascade.
 //
-//   node settings.mjs --url <orcarouter-url> --key <api-key> --repo owner/name
-//     --out <path.json>
+//   node settings.mjs --url <orcarouter-url> --repo owner/name --out <path.json>
+//   (the API key comes from ORCAROUTER_API_KEY in the env, never a flag)
 //
 // GETs <origin of --url>/api/code_review/settings?repo=<owner/name> (the
 // /v1/… path of the chat-completions URL is stripped, same as report.mjs)

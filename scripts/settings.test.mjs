@@ -17,7 +17,7 @@
 // UNfiltered result — quiet mode only mutes what gets POSTED.
 
 import http from "node:http";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -377,13 +377,43 @@ describe("action.yml wiring (settings, quiet mode)", () => {
     );
   });
 
-  test("only the POST step reads the quiet-filtered result; gate + report keep the true counts", () => {
+  test("only the POST step reads the quiet-filtered result; gate + BOTH report steps keep the true counts", () => {
     const yml = actionYml();
     const post = yml.slice(yml.indexOf("- name: Post review comments"), yml.indexOf("- name: Summary comment"));
     assert.match(post, /result-posted\.json/, "posting must read the quiet-filtered file");
     const gate = yml.slice(yml.indexOf("- name: Enforce severity gate"), yml.indexOf("- name: Report run (cheap tier)"));
     assert.match(gate, /\/result\.json/, "the gate must read the unfiltered result");
     assert.doesNotMatch(gate, /result-posted\.json/, "the gate must NOT read the filtered result");
+    // The per-tier report steps read the UNFILTERED tier snapshots (RESULT_CHEAP
+    // / RESULT_STRONG), never the quiet-filtered posted copy — quiet mutes the
+    // timeline, never enforcement or reporting.
+    const cheapReport = yml.slice(yml.indexOf("- name: Report run (cheap tier)"), yml.indexOf("- name: Report run (strong tier)"));
+    assert.match(cheapReport, /result-cheap\.json/, "the cheap report must read the unfiltered cheap snapshot");
+    assert.doesNotMatch(cheapReport, /result-posted\.json/, "the cheap report must NOT read the filtered result");
+    const strongReport = yml.slice(yml.indexOf("- name: Report run (strong tier)"), yml.indexOf("- name: Clean up engine output"));
+    assert.match(strongReport, /result-strong\.json/, "the strong report must read the unfiltered strong snapshot");
+    assert.doesNotMatch(strongReport, /result-posted\.json/, "the strong report must NOT read the filtered result");
+  });
+
+  test("the settings + both report steps take the API key from ORCAROUTER_API_KEY env and pass NO --key flag (argv-leak guard)", () => {
+    const yml = actionYml();
+    const blocks = {
+      "Fetch review settings": yml.slice(yml.indexOf("- name: Fetch review settings"), yml.indexOf("- name: Skip review (settings)")),
+      "Report run (cheap tier)": yml.slice(yml.indexOf("- name: Report run (cheap tier)"), yml.indexOf("- name: Report run (strong tier)")),
+      "Report run (strong tier)": yml.slice(yml.indexOf("- name: Report run (strong tier)"), yml.indexOf("- name: Clean up engine output")),
+    };
+    for (const [name, block] of Object.entries(blocks)) {
+      assert.match(block, /ORCAROUTER_API_KEY:/, `${name} must inject the key via ORCAROUTER_API_KEY env`);
+      assert.doesNotMatch(block, /--key\b/, `${name} must NOT pass a --key flag (it would leak via /proc/<pid>/cmdline)`);
+    }
+  });
+
+  test("the summary step passes --held + --fix-first in the held branch so the ❌ count follows fix-first", () => {
+    const yml = actionYml();
+    const summary = yml.slice(yml.indexOf("- name: Summary comment"), yml.indexOf("- name: Enforce severity gate"));
+    assert.match(summary, /FIX_FIRST: \$\{\{ steps\.settings\.outputs\.fix_first \}\}/, "the fix-first set must reach the summary step");
+    assert.match(summary, /HELD === 'true'/, "the held branch must be keyed off the cascade's held output");
+    assert.match(summary, /'--held', '--fix-first'/, "held runs must pass --held --fix-first to summary-comment.mjs");
   });
 
   test("the summary step passes the EFFECTIVE block-on set to summary-comment.mjs", () => {
@@ -417,5 +447,58 @@ describe("action.yml wiring (settings, quiet mode)", () => {
     assert.match(summary, /orca-code-review-disabled/, "the 'auto review off' notice must be cleaned up");
     assert.match(summary, /orca-code-review-skip/, "the 'diff too large' notice must be cleaned up");
     assert.match(summary, /deleteComment/, "cleanup means deleting the stale comment");
+  });
+});
+
+// The auto-review-authors allowlist is enforced by a bash function inside the
+// "Fetch review settings" step. Extract that EXACT function from action.yml and
+// exercise it directly (a shell harness invoked from node:test), so the
+// comma-anchored, space-trimmed membership logic is actually covered.
+describe("action.yml: auto-review-authors allowlist gate (author_allowed)", () => {
+  const actionYml = () => readFileSync(join(SCRIPTS, "..", "action.yml"), "utf8");
+
+  // Pull the real `author_allowed() { … }` definition out of the step. The
+  // function body has no nested braces, so a non-greedy match to the first
+  // brace-only line captures it whole regardless of indentation.
+  function extractFn() {
+    const m = actionYml().match(/author_allowed\(\) \{[\s\S]*?\n[ \t]*\}/);
+    assert.ok(m, "the author_allowed gate function must exist in action.yml");
+    return m[0];
+  }
+
+  // allow|deny for a given allowlist + association, running the extracted
+  // function under the same `set -eo pipefail` GitHub gives `shell: bash`.
+  function decide(list, assoc) {
+    const script = `set -eo pipefail\n${extractFn()}\nauthor_allowed "$1" "$2"\n`;
+    const r = spawnSync("bash", ["-c", script, "bash", list, assoc], { encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  }
+
+  test("association NOT in the allowlist -> deny (the ,X, anchor rejects a substring match)", () => {
+    // FIRST_TIME_CONTRIBUTOR must NOT match an allowlist of CONTRIBUTOR.
+    assert.equal(decide("CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"), "deny");
+  });
+
+  test("association in the allowlist -> allow (review proceeds)", () => {
+    assert.equal(decide("CONTRIBUTOR,MEMBER", "CONTRIBUTOR"), "allow");
+  });
+
+  test("empty allowlist -> allow everyone (default, preserves behavior)", () => {
+    assert.equal(decide("", "NONE"), "allow");
+  });
+
+  test("an all-space allowlist normalizes to empty -> allow everyone", () => {
+    assert.equal(decide("   ", "NONE"), "allow");
+  });
+
+  test("the match is case-insensitive", () => {
+    assert.equal(decide("MEMBER", "member"), "allow");
+  });
+
+  test("'OWNER, MEMBER' (comma-space) still matches MEMBER after the trim fix", () => {
+    assert.equal(decide("OWNER, MEMBER", "MEMBER"), "allow");
+    // …and still denies an association that is genuinely absent.
+    assert.equal(decide("OWNER, MEMBER", "CONTRIBUTOR"), "deny");
   });
 });

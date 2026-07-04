@@ -177,6 +177,52 @@ describe("gate line", () => {
   });
 });
 
+describe("held run (cheap tier withheld escalation on fix-first findings)", () => {
+  test("held + empty --block-on: the ❌ count follows the FIX-FIRST set, never the contradictory '0 findings'", () => {
+    const out = run(
+      ["[P0] a", "[P1] b", "[P2] c"],
+      // block_on='' would make the block-on count 0; --held must count fix-first (P0+P1=2).
+      ["--tier", "cheap", "--push", "1", "--gate", "blocked", "--block-on", "", "--held", "--fix-first", "P0,P1"],
+    );
+    assert.match(out, /Tier: CHEAP — held/, `held tier line expected:\n${out}`);
+    assert.ok(out.includes("❌ 2 findings block merge"), `held count must be over fix-first, got:\n${out}`);
+    assert.ok(!out.includes("❌ 0 findings"), "a held run must never render the self-contradictory 0-count");
+  });
+
+  test("held count uses fix-first even when block-on covers different severities", () => {
+    const out = run(
+      ["[P0] a", "[P1] b"],
+      ["--tier", "cheap", "--push", "1", "--gate", "blocked", "--block-on", "P2", "--held", "--fix-first", "P0,P1"],
+    );
+    assert.ok(out.includes("❌ 2 findings block merge"), `got:\n${out}`);
+  });
+
+  test("a single held finding reads singular", () => {
+    const out = run(
+      ["[P0] only"],
+      ["--tier", "cheap", "--push", "1", "--gate", "blocked", "--block-on", "", "--held", "--fix-first", "P0,P1"],
+    );
+    assert.ok(out.includes("❌ 1 finding blocks merge"), `got:\n${out}`);
+  });
+
+  test("non-held behavior is unchanged: the count still follows --block-on", () => {
+    const out = run(
+      ["[P0] a", "[P2] b", "[P2] c"],
+      ["--tier", "strong", "--push", "1", "--gate", "blocked", "--block-on", "P2"],
+    );
+    assert.ok(out.includes("❌ 2 findings block merge"), `got:\n${out}`);
+  });
+
+  test("an unknown severity in --fix-first exits 2 — a wiring bug must be loud", () => {
+    const r = spawnSync(
+      "node",
+      [SUMMARY, join(dir, "x.json"), "--tier", "cheap", "--push", "1", "--gate", "blocked", "--held", "--fix-first", "P0,P9"],
+      { encoding: "utf8" },
+    );
+    assert.equal(r.status, 2);
+  });
+});
+
 describe("mode notes (exhaustive / quiet)", () => {
   test("--passes > 1 renders the exhaustive note; state JSON is unchanged", () => {
     const out = run(["[P0] a"], ["--tier", "strong", "--push", "2", "--gate", "blocked", "--passes", "3"]);
