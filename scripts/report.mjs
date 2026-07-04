@@ -7,9 +7,11 @@
 //   (the API key comes from ORCAROUTER_API_KEY in the env, never a flag)
 //
 // POSTs {repo, pr_number, head_sha, tier, p0, p1, p2, gate_result[,
-// engine_version]} to <origin of --url>/api/code_review/report (the /v1/…
-// path of the chat-completions URL is stripped) with `Authorization: Bearer
-// <key>`. Severity counts come from the SAME result JSON gate.mjs reads, via
+// engine_version]} to <gateway base>/api/code_review/report — the gateway
+// base is --url with the trailing /v1 relay segment removed but any mount
+// sub-path kept (https://host/orca/v1/… -> https://host/orca), so a
+// path-prefixed self-hosted gateway resolves correctly. Auth: `Authorization:
+// Bearer <key>`. Severity counts come from the SAME result JSON gate.mjs reads, via
 // the shared severity.mjs (leading tag + untagged->P1 fail-safe) — counts and
 // gate result only, never code, diff, or finding text.
 //

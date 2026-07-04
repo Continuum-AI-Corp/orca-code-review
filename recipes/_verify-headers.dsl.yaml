@@ -16,7 +16,7 @@ version: 1
 rules:
   - id: header-probe
     when: 'headers["x-cr-prev-tier"] == "strong"'
-    use: { model: "z-ai/glm-5.2" }   # for testing, temporarily swap to z-ai/glm-5.1
+    use: { model: "z-ai/glm-5.1" }
 
 default:
   model: "deepseek/deepseek-v4-pro"

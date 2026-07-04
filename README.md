@@ -135,6 +135,8 @@ All optional — pass as `with:` inputs on the action:
 | `settings` | `true` | Fetch per-repo settings from the OrcaRouter dashboard on every run; set `"false"` to skip the fetch and make the workflow file authoritative (inputs/defaults apply as-is, no dashboard override) |
 | `auto-review-authors` | `""` (everyone) | Comma-separated author-association allowlist for **automatic** reviews. Empty reviews every PR. On a **public** repo, set e.g. `OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR` so anonymous fork PRs can't drain your wallet with paid cascades (they can still be reviewed on demand via `/orcarouter-review`). See [Public repos & spend](#public-repos--spend). |
 | `report` | `true` | Send a per-run summary (severity counts only — never code) to the OrcaRouter control plane; set `"false"` to disable — see [Run reporting](#run-reporting) |
+| `github-token` | `${{ github.token }}` | Token used to fetch the PR head, post review comments, and manage the tier label; override only if the default `GITHUB_TOKEN` lacks the needed scopes |
+| `engine-version` | `1.3.13` | Pinned `@alibaba-group/open-code-review` version (the review engine); bump deliberately after testing — later steps parse its JSON output shape |
 
 `fix-first` and `block-on` can also be set per-repo from the OrcaRouter
 dashboard — see the precedence rule under

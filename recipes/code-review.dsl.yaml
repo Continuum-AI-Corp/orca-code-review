@@ -20,7 +20,7 @@ version: 1
 rules:
   - id: promoted
     when: 'headers["x-cr-prev-tier"] == "strong"'
-    use: { model: "z-ai/glm-5.2" }
+    use: { model: "z-ai/glm-5.1" }
 
   - id: holding
     when: 'headers["x-cr-prev-tier"] == "cheap" && headers["x-cr-prev-p0p1"] == "true"'
@@ -28,7 +28,7 @@ rules:
 
   - id: escalate
     when: 'headers["x-cr-prev-tier"] == "cheap" && headers["x-cr-prev-p0p1"] == "false"'
-    use: { model: "z-ai/glm-5.2" }
+    use: { model: "z-ai/glm-5.1" }
 
 default:
   model: "deepseek/deepseek-v4-pro"
