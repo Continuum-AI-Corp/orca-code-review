@@ -55,6 +55,8 @@ jobs:
           # router: "orcarouter/code-review"  # router whose DSL picks the model per tier
           # fix-first: "P0,P1"   # withhold the strong tier until these are fixed
           # block-on: "P0"       # fail the check (block merge) on these
-          # max-diff-kb: "512"   # bigger diffs skip the review (check passes with a notice)
+          # max-diff-kb: "512"   # bigger diffs skip the review (outcome: on-oversized-diff)
           # max-diff-files: "300"  # same skip when the diff touches more files than this
+          # on-oversized-diff: "fail"  # oversized skip fails the check; "pass" makes it advisory
+          # settings: "true"     # "false" skips the dashboard fetch — this file is authoritative
           # report: "true"       # per-run severity counts (never code) to your control plane

@@ -129,8 +129,10 @@ All optional — pass as `with:` inputs on the action:
 | `router` | `orcarouter/code-review` | OrcaRouter router alias whose DSL recipe picks the cheap/strong model per tier (the action names no models) |
 | `fix-first` | `P0,P1` | Keep the PR on the cheap tier until these are cleared (then it's promoted) |
 | `block-on` | `P0,P1` | Fail the check (block merge) on one of these |
-| `max-diff-kb` | `512` | Skip the review when the merge-base diff is bigger than this many KB — a skip posts a notice and **passes** the check (never blocks a merge) without running the engine |
-| `max-diff-files` | `300` | Skip the review (same pass-with-notice behavior) when the diff touches more than this many files |
+| `max-diff-kb` | `512` | Skip the review when the merge-base diff is bigger than this many KB — a skip posts a notice without running the engine; the check's outcome is `on-oversized-diff` |
+| `max-diff-files` | `300` | Skip the review (same notice + `on-oversized-diff` outcome) when the diff touches more than this many files |
+| `on-oversized-diff` | `fail` | What an oversized-diff skip does to the check: `fail` (default) fails it, so a diff padded past the limits can never bypass a required merge gate; `pass` makes skips advisory (notice + green check) |
+| `settings` | `true` | Fetch per-repo settings from the OrcaRouter dashboard on every run; set `"false"` to skip the fetch and make the workflow file authoritative (inputs/defaults apply as-is, no dashboard override) |
 | `report` | `true` | Send a per-run summary (severity counts only — never code) to the OrcaRouter control plane; set `"false"` to disable — see [Run reporting](#run-reporting) |
 
 `fix-first` and `block-on` can also be set per-repo from the OrcaRouter
@@ -148,7 +150,7 @@ OrcaRouter dashboard without touching the workflow:
 |---|---|---|
 | `auto_review` | `true` / `false` | `false`: automatic (`pull_request_target`) runs skip the engine, leave one small "automatic review is off" comment, and **pass** the check. `/orcarouter-review` comment commands still run. |
 | `trigger` | `every_push` / `ready_for_review` / `on_demand` | `every_push`: review every push. `ready_for_review`: skip automatic runs **while the PR is a draft** (add `ready_for_review` to your workflow's `pull_request_target.types` so the review fires when the PR leaves draft). `on_demand`: skip all automatic runs — only `/orcarouter-review` comments review. All skips pass the check. |
-| `exhaustive` | `false` / `true` | Re-run the engine up to **2 extra times per tier**, deduplicating findings across passes (one review pass is not exhaustive; a re-run surfaces missed findings). The loop stops early once a pass adds nothing new. **Cost caveat: up to 3× engine passes per tier**, so up to ~6× tokens on an escalating run. The summary comment notes `exhaustive: N passes`. |
+| `exhaustive` | `false` / `true` | Re-run the engine up to **2 extra times on the strong (enforced) tier**, deduplicating findings across passes (one review pass is not exhaustive; a re-run surfaces missed findings). The cheap screening pass never gets extras — its result is either superseded by the same-run strong review or held on fix-first findings anyway. The loop stops early once a pass adds nothing new **or a fix-first (P0/P1) finding is already in hand** (the gate blocks on it regardless of extra depth). **Cost cap: at most 3 engine passes total on the enforced tier.** The summary comment notes `exhaustive: N passes`. |
 | `quiet` | `false` / `true` | Advisory **P2 comments are not posted inline** — they are muted at the posting step only. The summary comment keeps the **true** P0/P1/P2 counts with a `quiet mode: P2 shown in summary only` note, and the gate/run report always see the unfiltered counts. |
 | `fix_first` | `"P0,P1"` | Same meaning as the `fix-first` input — see precedence below. |
 | `block_on` | `"P0,P1"` | Same meaning as the `block-on` input — see precedence below. |
@@ -159,6 +161,15 @@ OrcaRouter dashboard without touching the workflow:
 server setting; an input left at (or set to) the default defers to the server.
 So dashboard-managed repos just omit the inputs, and a workflow that pins
 `block-on: "P0"` keeps that pin even if the dashboard says otherwise.
+
+**Making the workflow file authoritative:** because a default-valued input
+defers to the server, pinning the *documented default itself* (e.g.
+`block-on: "P0,P1"`) cannot prevent a dashboard override. If the workflow file
+must be the single source of truth, set `settings: "false"` on the action —
+the fetch is skipped entirely, every input (or its documented default)
+applies as-is, and none of the dashboard settings above (including
+`auto_review` / `trigger` gating, `exhaustive`, `quiet`, and `rubric`) can
+take effect.
 
 **Everything fails open to the defaults.** If the settings endpoint is
 unreachable, times out (5s, one retry), or returns garbage, the action logs it
@@ -211,6 +222,16 @@ repo setting:
 Now a failing review disables the merge button until it goes green. Re-run the
 gate by pushing a new commit (the `/orcarouter-review` comment posts a fresh
 read but can't flip the required check — see the per-commit loop note above).
+
+**Merge-gate note — oversized diffs.** An oversized-diff skip (`max-diff-kb` /
+`max-diff-files`) **fails the check by default** (`on-oversized-diff: "fail"`):
+if a skip passed, padding a PR past the size limit would bypass the P0/P1 gate
+entirely without a single finding being read. When the check fails for size,
+raise the limits, split the PR, or — if you accept that oversized PRs merge
+unreviewed — set `on-oversized-diff: "pass"` to restore the advisory
+skip-and-pass behavior. Settings-based skips (auto-review off, draft PRs,
+on-demand mode) still pass the check: those are deliberate "don't review"
+states, not a gate bypass.
 
 ## Try it locally (optional)
 

@@ -2,16 +2,23 @@
 // cascade facts onto OCR's requests and forwards them to the OrcaRouter
 // gateway.
 //
-// Retry contract (A3): 429/502/503/504 and connection errors are retried up to
-// 3 more attempts with 1s/2s/4s backoff; a numeric Retry-After header (seconds)
-// wins, capped at 30s. The request body is fully buffered BEFORE the first
-// attempt so every retry replays identical bytes. Any other status — crucially
-// every other 4xx — is relayed immediately, and a final failure relays the
-// upstream status/body unchanged. Every response carries x-cr-retry-count.
+// Retry contract (A3): 429/502/503/504 is retried up to 3 more attempts with
+// 1s/2s/4s backoff; a numeric Retry-After header (seconds) wins, capped at
+// 30s. Connection errors are retried ONLY when they prove the request was
+// never processed (ECONNREFUSED/ENOTFOUND/EAI_AGAIN, or an error before the
+// body finished flushing) — a post-send reset may already have been billed
+// and is surfaced as 502 instead. The request body is fully buffered BEFORE
+// the first attempt so every retry replays identical bytes, capped at
+// maxBufferBytes (8 MiB default): larger bodies stream straight through with
+// retries disabled. Once a response has started relaying, nothing retries —
+// a mid-relay failure terminates the client connection fast (no hang, no
+// double writeHead). Any other status — crucially every other 4xx — is
+// relayed immediately, and a final failure relays the upstream status/body
+// unchanged. Every response carries x-cr-retry-count.
 //
-// The proxy exposes an injectable `sleep` (test seam only); its CLI contract —
-// env-driven config, `PROXY_URL=…` printed on listen — is unchanged and is
-// exercised by the last test.
+// The proxy exposes injectable `sleep` and `maxBufferBytes` (test seams
+// only); its CLI contract — env-driven config, `PROXY_URL=…` printed on
+// listen — is unchanged and is exercised by the last test.
 
 import http from "node:http";
 import { spawn } from "node:child_process";
@@ -90,6 +97,52 @@ function request(port, { path = "/v1/chat/completions", body = "", headers = {} 
     req.end(body);
   });
 }
+
+// Client that TOLERATES a mid-body failure: always resolves with what it saw
+// (never rejects, never hangs past the cap) so tests can assert on truncated
+// or terminated responses. `timedOut: true` means the proxy left the
+// connection open — the hang the mid-relay handling must prevent.
+function requestOutcome(port, { path = "/v1/chat/completions", body = "" } = {}, capMs = 5000) {
+  return new Promise((resolve) => {
+    const outcome = { status: null, endedCleanly: false, timedOut: false };
+    const timer = setTimeout(() => {
+      outcome.timedOut = true;
+      req.destroy();
+      resolve(outcome);
+    }, capMs);
+    const finish = () => {
+      clearTimeout(timer);
+      resolve(outcome);
+    };
+    const req = http.request({ host: "127.0.0.1", port, path, method: "POST" }, (res) => {
+      outcome.status = res.statusCode;
+      res.on("data", () => {});
+      res.on("end", () => {
+        outcome.endedCleanly = true;
+      });
+      res.on("error", () => {});
+      res.on("close", finish);
+    });
+    req.on("error", finish);
+    req.end(body);
+  });
+}
+
+// Upstream double for failure injection: `handler(req, res, hit)` decides per
+// request; `hits()` reports how many requests arrived (the retry counter).
+async function startRawUpstream(handler) {
+  let hits = 0;
+  const server = http.createServer((req, res) => {
+    hits += 1;
+    const hit = hits;
+    req.resume();
+    req.on("end", () => handler(req, res, hit));
+  });
+  const port = await listen(server);
+  return { port, hits: () => hits, close: () => new Promise((r) => server.close(r)) };
+}
+
+const settle = (ms = 100) => new Promise((r) => setTimeout(r, ms));
 
 describe("retry / backoff", () => {
   test("503 twice then 200 -> 1s/2s backoff; facts and buffered body replayed on every attempt", async () => {
@@ -265,6 +318,136 @@ describe("non-retryable statuses", () => {
     } finally {
       await proxy.close();
       await upstream.close();
+    }
+  });
+});
+
+describe("mid-relay failures (the response already started — never retry)", () => {
+  test("SSE stream dies after 200: client terminated fast (no hang), NO retry, proxy survives", async () => {
+    const upstream = await startRawUpstream((req, res, hit) => {
+      if (hit === 1) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write("data: partial\n\n");
+        setTimeout(() => res.socket.resetAndDestroy(), 20);
+      } else {
+        res.writeHead(200);
+        res.end("ok");
+      }
+    });
+    const sleep = fakeSleep();
+    const proxy = await startProxy({
+      upstreamUrl: `http://127.0.0.1:${upstream.port}/v1/chat/completions`,
+      sleep: sleep.fn,
+    });
+    try {
+      const outcome = await requestOutcome(proxy.port, { body: "{}" });
+      assert.equal(outcome.timedOut, false, "a mid-stream failure must terminate the client response, not hang it");
+      assert.equal(outcome.status, 200, "the relay had already started when the stream died");
+      assert.equal(outcome.endedCleanly, false, "the truncated stream must not end as a clean response");
+      await settle(); // give a (buggy) scheduled retry time to fire
+      assert.equal(upstream.hits(), 1, "once the response started relaying, the request must never be retried");
+      assert.deepEqual(sleep.calls, [], "no backoff may be scheduled after the relay started");
+      // The proxy itself must still be alive and serving (the old retry path
+      // died here on ERR_HTTP_HEADERS_SENT).
+      const again = await request(proxy.port, { body: "{}" });
+      assert.equal(again.status, 200);
+      assert.equal(again.body, "ok");
+    } finally {
+      await proxy.close();
+      await upstream.close();
+    }
+  });
+
+  test("socket reset while draining a retryable 503 body: exactly ONE retry chain, no crash", async () => {
+    const upstream = await startRawUpstream((req, res, hit) => {
+      if (hit === 1) {
+        // Retryable status whose body never completes: the retry is scheduled
+        // off the headers, then the drain gets reset mid-flight.
+        res.writeHead(503, { "content-length": "1048576" });
+        res.write("partial 503 body");
+        setTimeout(() => res.socket.resetAndDestroy(), 20);
+      } else {
+        res.writeHead(200);
+        res.end("recovered");
+      }
+    });
+    const sleep = fakeSleep();
+    const proxy = await startProxy({
+      upstreamUrl: `http://127.0.0.1:${upstream.port}/v1/chat/completions`,
+      sleep: sleep.fn,
+    });
+    try {
+      const res = await request(proxy.port, { body: "{}" });
+      assert.equal(res.status, 200);
+      assert.equal(res.body, "recovered");
+      assert.equal(res.headers["x-cr-retry-count"], "1");
+      await settle(); // a duplicate (second) retry chain would land in this window
+      assert.equal(upstream.hits(), 2, "the drain-phase reset must not start a second parallel retry chain");
+      assert.deepEqual(sleep.calls, [1000], "exactly one backoff for exactly one retry");
+    } finally {
+      await proxy.close();
+      await upstream.close();
+    }
+  });
+});
+
+describe("idempotency: only provably-unprocessed connection errors retry", () => {
+  test("ECONNRESET after the request was fully sent (no response yet) is NOT retried -> 502", async () => {
+    const upstream = await startRawUpstream((req, res) => {
+      // Full request consumed, then reset without answering: ambiguous — the
+      // gateway may already have processed (and billed) the completion.
+      setTimeout(() => req.socket.resetAndDestroy(), 10);
+    });
+    const sleep = fakeSleep();
+    const proxy = await startProxy({
+      upstreamUrl: `http://127.0.0.1:${upstream.port}/v1/chat/completions`,
+      sleep: sleep.fn,
+    });
+    try {
+      const res = await request(proxy.port, { body: '{"model":"m"}' });
+      assert.equal(res.status, 502);
+      assert.equal(res.headers["x-cr-retry-count"], "0", "no retries were performed");
+      await settle();
+      assert.equal(upstream.hits(), 1, "a post-send reset must reach upstream exactly once");
+      assert.deepEqual(sleep.calls, [], "no backoff for a non-retryable error");
+    } finally {
+      await proxy.close();
+      await upstream.close();
+    }
+  });
+
+  test("a body over maxBufferBytes streams through: delivered byte-identical, retries disabled even on 503", async () => {
+    // Count the body server-side without buffering 8 MiB in the double; a
+    // retryable 503 answer proves status retries are off for streamed bodies.
+    let seenBytes = 0;
+    let hits = 0;
+    const counting = http.createServer((req, res) => {
+      hits += 1;
+      req.on("data", (c) => (seenBytes += c.length));
+      req.on("end", () => {
+        res.writeHead(503, { "content-type": "text/plain" });
+        res.end("busy");
+      });
+    });
+    const countingPort = await listen(counting);
+    const sleep = fakeSleep();
+    const proxy = await startProxy({
+      upstreamUrl: `http://127.0.0.1:${countingPort}/v1/chat/completions`,
+      sleep: sleep.fn,
+    });
+    try {
+      const body = Buffer.alloc(8 * 1024 * 1024 + 1024, "x"); // just over the 8 MiB default cap
+      const res = await request(proxy.port, { body });
+      assert.equal(res.status, 503, "the retryable status is relayed as-is — nothing kept to replay");
+      assert.equal(res.body, "busy");
+      assert.equal(res.headers["x-cr-retry-count"], "0");
+      assert.equal(seenBytes, body.length, "the streamed body must arrive complete");
+      await settle();
+      assert.equal(hits, 1, "a streamed body must hit upstream exactly once");
+      assert.deepEqual(sleep.calls, [], "retries are disabled for a streamed (unbuffered) body");
+    } finally {
+      await proxy.close();
+      await new Promise((r) => counting.close(r));
     }
   });
 });

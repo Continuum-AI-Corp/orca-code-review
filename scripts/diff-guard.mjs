@@ -14,12 +14,14 @@
 //   {"decision":"review"|"skip","reason":"…","size_kb":<n>,"files":<n>}
 //
 // Defaults: 512 KB / 300 files (surfaced as the action's `max-diff-kb` /
-// `max-diff-files` inputs). `files` counts `diff --git` file headers — in a
-// unified diff every content line is prefixed (' ', '+', '-'), so a header at
-// column 0 is unambiguous. A diff exactly AT a limit is still reviewed; only
-// strictly-over skips. Fail-open: a missing/unreadable/empty diff (or a bad
-// flag) yields "review" with the reason — a guard glitch must never silently
-// disable the review.
+// `max-diff-files` inputs). The size check is decided from stat() alone — an
+// oversized diff is never read into memory, so a size-skip reports files: 0
+// (not counted). Only an under-cap diff is read to count files. `files`
+// counts `diff --git` file headers — in a unified diff every content line is
+// prefixed (' ', '+', '-'), so a header at column 0 is unambiguous. A diff
+// exactly AT a limit is still reviewed; only strictly-over skips. Fail-open:
+// a missing/unreadable/empty diff (or a bad flag) yields "review" with the
+// reason — a guard glitch must never silently disable the review.
 
 import fs from "node:fs";
 
@@ -49,6 +51,39 @@ function decide() {
       files: 0,
     };
   }
+  // Decide the size limit from stat() alone: an oversized diff (possibly
+  // hundreds of MB) is skipped without ever being read into memory. The file
+  // count is only computed — and the file only read — when the size is under
+  // the cap.
+  let size;
+  try {
+    size = fs.statSync(diffPath).size;
+  } catch (e) {
+    return {
+      decision: "review",
+      reason: `could not read diff (${e.message}) — failing open to review`,
+      size_kb: 0,
+      files: 0,
+    };
+  }
+  if (size === 0) {
+    return {
+      decision: "review",
+      reason: "empty diff — failing open to review",
+      size_kb: 0,
+      files: 0,
+    };
+  }
+  const sizeKb = Math.round((size / 1024) * 10) / 10;
+  // Compare raw bytes, not the rounded display value, so "at the limit" is exact.
+  if (size > maxKb * 1024) {
+    return {
+      decision: "skip",
+      reason: `diff is ${sizeKb} KB, over the ${maxKb} KB limit`,
+      size_kb: sizeKb,
+      files: 0, // not read, not counted
+    };
+  }
   let buf;
   try {
     buf = fs.readFileSync(diffPath);
@@ -60,28 +95,10 @@ function decide() {
       files: 0,
     };
   }
-  if (buf.length === 0) {
-    return {
-      decision: "review",
-      reason: "empty diff — failing open to review",
-      size_kb: 0,
-      files: 0,
-    };
-  }
-  const sizeKb = Math.round((buf.length / 1024) * 10) / 10;
   const files = buf
     .toString("utf8")
     .split("\n")
     .filter((line) => line.startsWith("diff --git ")).length;
-  // Compare raw bytes, not the rounded display value, so "at the limit" is exact.
-  if (buf.length > maxKb * 1024) {
-    return {
-      decision: "skip",
-      reason: `diff is ${sizeKb} KB, over the ${maxKb} KB limit`,
-      size_kb: sizeKb,
-      files,
-    };
-  }
   if (files > maxFiles) {
     return {
       decision: "skip",

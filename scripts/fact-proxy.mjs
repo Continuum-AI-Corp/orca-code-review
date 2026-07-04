@@ -16,14 +16,28 @@
 // absent/empty/unparseable file stamps nothing (the DSL falls through to its
 // default, i.e. the cheap tier).
 //
-// Retry: transient upstream failures — HTTP 429/502/503/504 or a connection
-// error — are retried up to 3 more attempts with 1s/2s/4s backoff; a numeric
-// Retry-After header (seconds) wins, capped at 30s. To make replays safe the
-// request body is fully buffered BEFORE the first attempt (the old code piped
-// it upstream, and a consumed stream can't be replayed). Any other status —
-// every other 4xx included — is never retried, and a final failure relays the
-// upstream status/body unchanged. Every response carries x-cr-retry-count
-// (retries actually performed) for observability.
+// Retry: transient upstream failures are retried up to 3 more attempts with
+// 1s/2s/4s backoff; a numeric Retry-After header (seconds) wins, capped at
+// 30s. WHAT is retryable is deliberately narrow, because a replayed chat
+// completion is not idempotent — a duplicate can double-bill:
+//   - HTTP 429/502/503/504: a response was received, so the gateway owned the
+//     request and answered "not processed" — safe to replay. No other status
+//     is ever retried (every other 4xx included).
+//   - Connection errors ONLY when they prove the upstream never began
+//     processing: ECONNREFUSED / ENOTFOUND / EAI_AGAIN (the connection or name
+//     lookup never came up), or any error raised BEFORE the request body
+//     finished flushing. An ECONNRESET after the body was fully sent (and
+//     before any response) is ambiguous — the gateway may already have
+//     consumed and billed the request — so it is surfaced as 502, NOT replayed.
+//   - Once a response has started relaying to the client, NOTHING is retried:
+//     the response headers are already out, so a mid-stream failure destroys
+//     the client connection (fail fast) instead of re-attempting.
+// To make replays safe the request body is buffered BEFORE the first attempt,
+// capped at 8 MiB: a larger body streams straight through with ALL retries
+// disabled for that request (nothing is kept to replay; memory stays bounded).
+// A final failure relays the upstream status/body unchanged (502 for a
+// connection error). Every response carries x-cr-retry-count (retries actually
+// performed) for observability.
 //
 // Env:
 //   ORCAROUTER_URL  full upstream chat-completions URL (origin + path forwarded)
@@ -33,9 +47,10 @@
 // never logged.
 //
 // Exported for tests: createProxyServer({ upstreamUrl, factsFile,
-// policyBlockFile, sleep, maxRetries }) returns an unlistened http.Server —
-// `sleep` is the injectable backoff seam. The CLI entry below keeps the
-// original env-var + PROXY_URL contract; action.yml usage is unchanged.
+// policyBlockFile, sleep, maxRetries, maxBufferBytes }) returns an unlistened
+// http.Server — `sleep` is the injectable backoff seam and `maxBufferBytes`
+// the retry-buffer cap. The CLI entry below keeps the original env-var +
+// PROXY_URL contract; action.yml usage is unchanged.
 
 import http from "node:http";
 import https from "node:https";
@@ -43,8 +58,17 @@ import fs from "node:fs";
 import { URL, pathToFileURL } from "node:url";
 
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+// Connection-error codes that PROVE the request never reached processing:
+// name resolution or the TCP connect itself failed, so no bytes of the
+// request were ever consumed upstream. Everything else is judged by whether
+// the request body had finished flushing when the error fired.
+const PRE_PROCESSING_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]);
 const BACKOFF_MS = [1000, 2000, 4000];
 const RETRY_AFTER_CAP_MS = 30_000;
+// Bodies above this stream straight through (single attempt, no retries):
+// buffering arbitrarily large bodies for replay would unbound the proxy's
+// memory on a shared runner.
+const MAX_RETRY_BUFFER_BYTES = 8 * 1024 * 1024;
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // A guardrail (content policy) or firewall (tool-call policy) block arrives as
@@ -124,6 +148,7 @@ export function createProxyServer({
   policyBlockFile = "",
   sleep = defaultSleep,
   maxRetries = 3,
+  maxBufferBytes = MAX_RETRY_BUFFER_BYTES,
 } = {}) {
   const upstream = new URL(upstreamUrl);
   const upstreamLib = upstream.protocol === "http:" ? http : https;
@@ -134,92 +159,194 @@ export function createProxyServer({
     Object.assign(headers, readFacts(factsFile));
     const target = new URL(req.url, upstream);
 
-    // Buffer the request body fully BEFORE the first attempt: retries must
-    // replay identical bytes, and a piped stream can only be consumed once.
+    // Terminal failure for one client request. Before the relay: answer 502.
+    // After it: the headers are out, so destroy the connection — a truncated
+    // stream must error out fast, not leave OCR waiting until the job timeout.
+    const failResponse = (retries) => {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      res.writeHead(502, { "x-cr-retry-count": String(retries) });
+      res.end();
+    };
+
+    // Relay the (final) upstream response — the point of no return: the
+    // status/headers go on the wire here, so from now on NOTHING may retry
+    // (a second writeHead would throw ERR_HTTP_HEADERS_SENT and kill the
+    // whole proxy). relay() only ever runs at a terminal settle, so no retry
+    // can be scheduled after it. All relay paths stamp x-cr-retry-count so a
+    // flaky gateway is visible in the job log.
+    const relay = (upRes, status, retries) => {
+      const outHeaders = { ...upRes.headers, "x-cr-retry-count": String(retries) };
+      // Buffer a 400 so we can read the guardrail/firewall reason, then relay
+      // the identical bytes to OCR (which still fails closed). Everything else
+      // streams straight through so SSE stays unbuffered.
+      if (status === 400 && policyBlockFile) {
+        const parts = [];
+        upRes.on("data", (c) => parts.push(c));
+        upRes.on("end", () => {
+          const buf = Buffer.concat(parts);
+          recordPolicyBlock(buf, policyBlockFile);
+          res.writeHead(status, outHeaders);
+          res.end(buf);
+        });
+        upRes.on("error", () => {
+          if (!res.headersSent) res.writeHead(502);
+          res.end();
+        });
+        return;
+      }
+      res.writeHead(status, outHeaders);
+      upRes.pipe(res); // stream SSE through unbuffered
+      // pipe() forwards data, not errors — and http.IncomingMessage swallows
+      // an unlistened 'error' entirely, so without this handler a mid-stream
+      // upstream failure would leave `res` open forever (OCR would hang until
+      // the job timeout). Fail fast instead.
+      upRes.on("error", (e) => {
+        console.error(`fact-proxy: upstream stream failed mid-relay (${e.message}) — dropping the client connection`);
+        res.destroy();
+      });
+    };
+
+    const scheduleRetry = (body, nextRetries, ms) => {
+      // A broken sleep must not strand the request — retry immediately then.
+      Promise.resolve(sleep(ms)).then(
+        () => attempt(body, nextRetries),
+        () => attempt(body, nextRetries),
+      );
+    };
+
+    // One upstream attempt over the buffered body; `retries` = retries already
+    // performed (0-based). The `settled` latch guarantees exactly ONE of
+    // {relay, scheduleRetry, failResponse} runs per attempt: a socket reset
+    // while draining a retryable-status body fires upReq 'error' AFTER the
+    // status path already scheduled a retry, and without the latch that would
+    // start a second parallel retry chain (two relays -> double writeHead).
+    const attempt = (body, retries) => {
+      if (res.destroyed) return; // client gave up — nobody left to answer
+      let settled = false;
+      const settleThisAttempt = () => {
+        if (settled) return false;
+        settled = true;
+        return true;
+      };
+      let bodySent = false; // request body fully flushed to the socket
+      let relayedThisAttempt = false; // THIS attempt's response is the one relaying
+
+      const upReq = upstreamLib.request(
+        target,
+        { method: req.method, headers, host: upstream.host },
+        (upRes) => {
+          const status = upRes.statusCode || 502;
+          if (RETRYABLE_STATUS.has(status) && retries < maxRetries) {
+            if (!settleThisAttempt()) return;
+            // Drain and discard — this response is not relayed. The drain
+            // needs its own 'error' sink so a reset mid-drain is just noise
+            // (the retry below is already scheduled and owns the outcome).
+            upRes.on("error", (e) => {
+              console.error(`fact-proxy: discarded ${status} response errored while draining (${e.message})`);
+            });
+            upRes.resume();
+            const ms = retryDelayMs(retries, upRes.headers["retry-after"]);
+            console.error(
+              `fact-proxy: upstream ${status} — retry ${retries + 1}/${maxRetries} in ${ms}ms`,
+            );
+            scheduleRetry(body, retries + 1, ms);
+            return;
+          }
+          if (!settleThisAttempt()) return;
+          relayedThisAttempt = true;
+          relay(upRes, status, retries);
+        },
+      );
+      upReq.on("error", (e) => {
+        if (!settleThisAttempt()) {
+          // This attempt's outcome is already owned elsewhere. If it was owned
+          // by THIS attempt's relay, the stream just died mid-relay — fail the
+          // client fast rather than hanging. If it was owned by a scheduled
+          // retry (a drain-phase reset on a discarded 429/5xx body), do
+          // nothing: the fresh attempt must not be disturbed.
+          if (relayedThisAttempt) res.destroy();
+          return;
+        }
+        // Retry ONLY errors that prove the upstream never began processing
+        // (see the header): a replayed completion is not idempotent, and a
+        // reset after the body was fully sent may already have been billed.
+        const preProcessing = PRE_PROCESSING_CODES.has(e.code) || !bodySent;
+        if (retries < maxRetries && preProcessing) {
+          const ms = retryDelayMs(retries, undefined);
+          console.error(
+            `fact-proxy: upstream error (${e.message}) — retry ${retries + 1}/${maxRetries} in ${ms}ms`,
+          );
+          scheduleRetry(body, retries + 1, ms);
+          return;
+        }
+        console.error(
+          `fact-proxy: upstream error: ${e.message}${
+            retries < maxRetries ? " (after the request was sent — not retried)" : ""
+          }`,
+        );
+        failResponse(retries);
+      });
+      upReq.end(body, () => {
+        bodySent = true;
+      });
+    };
+
+    // Buffer the request body BEFORE the first attempt: retries must replay
+    // identical bytes, and a piped stream can only be consumed once. The
+    // buffer is capped: a body over maxBufferBytes flips to a single
+    // pass-through attempt with retries disabled (see startStreaming).
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("error", () => {
+    let buffered = 0;
+    let streaming = false;
+    let streamReq = null;
+
+    const startStreaming = () => {
+      streaming = true;
+      console.error(
+        `fact-proxy: request body exceeds ${maxBufferBytes} bytes — streaming through, retries disabled (nothing is kept to replay)`,
+      );
+      // The body streams through byte-identical, so the client's own
+      // content-length (if any) is still correct; without one Node re-chunks.
+      delete headers["transfer-encoding"];
+      const upReq = upstreamLib.request(
+        target,
+        { method: req.method, headers, host: upstream.host },
+        (upRes) => {
+          relay(upRes, upRes.statusCode || 502, 0);
+        },
+      );
+      upReq.on("error", (e) => {
+        console.error(`fact-proxy: upstream error (streamed body is unreplayable — not retried): ${e.message}`);
+        failResponse(0);
+      });
+      streamReq = upReq;
+      for (const c of chunks) upReq.write(c);
+      chunks.length = 0;
+      req.pipe(upReq); // pipe ends upReq when the client body ends
+    };
+
+    req.on("data", (c) => {
+      if (streaming) return; // the pipe carries everything from here on
+      chunks.push(c);
+      buffered += c.length;
+      if (buffered > maxBufferBytes) startStreaming();
+    });
+    req.on("error", (e) => {
+      if (streamReq) streamReq.destroy(e); // stop the upstream copy of a broken client body
       if (!res.headersSent) res.writeHead(400);
       res.end();
     });
     req.on("end", () => {
+      if (streaming) return; // completion is the pipe's job now
       const body = Buffer.concat(chunks);
       // The buffered body is replayed with its exact length; never forward the
       // client's transfer-encoding for a re-sent buffer.
       delete headers["transfer-encoding"];
       headers["content-length"] = String(body.length);
-
-      // Relay the (final) upstream response. All relay paths stamp
-      // x-cr-retry-count so a flaky gateway is visible in the job log.
-      const relay = (upRes, status, retries) => {
-        const outHeaders = { ...upRes.headers, "x-cr-retry-count": String(retries) };
-        // Buffer a 400 so we can read the guardrail/firewall reason, then relay
-        // the identical bytes to OCR (which still fails closed). Everything else
-        // streams straight through so SSE stays unbuffered.
-        if (status === 400 && policyBlockFile) {
-          const parts = [];
-          upRes.on("data", (c) => parts.push(c));
-          upRes.on("end", () => {
-            const buf = Buffer.concat(parts);
-            recordPolicyBlock(buf, policyBlockFile);
-            res.writeHead(status, outHeaders);
-            res.end(buf);
-          });
-          upRes.on("error", () => {
-            if (!res.headersSent) res.writeHead(502);
-            res.end();
-          });
-          return;
-        }
-        res.writeHead(status, outHeaders);
-        upRes.pipe(res); // stream SSE through unbuffered
-      };
-
-      const scheduleRetry = (nextRetries, ms) => {
-        // A broken sleep must not strand the request — retry immediately then.
-        Promise.resolve(sleep(ms)).then(
-          () => attempt(nextRetries),
-          () => attempt(nextRetries),
-        );
-      };
-
-      // One upstream attempt; `retries` = retries already performed (0-based).
-      const attempt = (retries) => {
-        if (res.destroyed) return; // client gave up — nobody left to answer
-        const upReq = upstreamLib.request(
-          target,
-          { method: req.method, headers, host: upstream.host },
-          (upRes) => {
-            const status = upRes.statusCode || 502;
-            if (RETRYABLE_STATUS.has(status) && retries < maxRetries) {
-              upRes.resume(); // drain and discard — this response is not relayed
-              const ms = retryDelayMs(retries, upRes.headers["retry-after"]);
-              console.error(
-                `fact-proxy: upstream ${status} — retry ${retries + 1}/${maxRetries} in ${ms}ms`,
-              );
-              scheduleRetry(retries + 1, ms);
-              return;
-            }
-            relay(upRes, status, retries);
-          },
-        );
-        upReq.on("error", (e) => {
-          if (retries < maxRetries) {
-            const ms = retryDelayMs(retries, undefined);
-            console.error(
-              `fact-proxy: upstream error (${e.message}) — retry ${retries + 1}/${maxRetries} in ${ms}ms`,
-            );
-            scheduleRetry(retries + 1, ms);
-            return;
-          }
-          console.error(`fact-proxy: upstream error: ${e.message}`);
-          if (!res.headersSent) res.writeHead(502, { "x-cr-retry-count": String(retries) });
-          res.end();
-        });
-        upReq.end(body);
-      };
-
-      attempt(0);
+      attempt(body, 0);
     });
   });
 }

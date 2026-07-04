@@ -24,7 +24,7 @@
 // that is a wiring bug in action.yml and must be loud, not quietly ignored.
 
 import fs from "node:fs";
-import { severityOf } from "./severity.mjs";
+import { SEVERITIES, severityOf } from "./severity.mjs";
 
 const usage = () => {
   console.error("usage: node quiet-filter.mjs <result.json> --drop P2[,P1] --out <filtered.json>");
@@ -45,7 +45,7 @@ const drop = new Set(
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean),
 );
-if (drop.size === 0 || [...drop].some((t) => !["P0", "P1", "P2"].includes(t))) usage();
+if (drop.size === 0 || [...drop].some((t) => !SEVERITIES.includes(t))) usage();
 
 let parsed = { comments: [] };
 try {

@@ -19,15 +19,17 @@
 # (recipes/code-review.dsl.yaml) maps them to the concrete cheap/strong model.
 #
 # Around the cascade: dashboard settings (scripts/settings.mjs, fetched
-# fail-open from the gateway) gate auto reviews (auto_review / trigger),
+# fail-open from the gateway; `settings: "false"` skips the fetch and makes
+# the workflow file authoritative) gate auto reviews (auto_review / trigger),
 # retune fix-first/block-on, and switch on quiet mode (P2 muted at posting via
 # scripts/quiet-filter.mjs — the gate/report still see true counts), an
-# exhaustive mode (extra engine passes deduped by
+# exhaustive mode (extra engine passes on the strong tier only, deduped by
 # scripts/exhaustive-merge.mjs), and a server-side rubric override; an
 # oversized-diff guard (scripts/diff-guard.mjs) decides review/skip BEFORE the
-# engine ever runs (a skip passes the check with a notice — it never blocks a
-# merge); one summary comment per PR (scripts/summary-comment.mjs) is upserted
-# in place on every push; and a best-effort per-tier run report
+# engine ever runs (a skip posts a notice and, by default, FAILS the check so
+# the merge gate can't be padded around — `on-oversized-diff: "pass"` makes it
+# advisory); one summary comment per PR (scripts/summary-comment.mjs) is
+# upserted in place on every push; and a best-effort per-tier run report
 # (scripts/report.mjs) posts severity counts — never code — to the OrcaRouter
 # control plane after the gate.
 
@@ -74,14 +76,31 @@ inputs:
   max-diff-kb:
     description: >-
       Skip the review when the PR's merge-base diff is bigger than this many
-      KB. A skip posts a notice and PASSES the check (it never blocks a merge)
-      without running the engine.
+      KB. A skip posts a notice without running the engine; whether the check
+      then fails or passes is `on-oversized-diff` (default: fail, so the
+      merge gate cannot be padded around).
     required: false
     default: "512"
   max-diff-files:
-    description: "Skip the review when the diff touches more than this many files (same pass-with-notice behavior as max-diff-kb)."
+    description: "Skip the review when the diff touches more than this many files (same notice + on-oversized-diff outcome as max-diff-kb)."
     required: false
     default: "300"
+  on-oversized-diff:
+    description: >-
+      What an oversized-diff skip does to the check. "fail" (default) fails
+      it — a diff padded past max-diff-kb / max-diff-files can then never
+      bypass a required merge gate. "pass" restores the advisory behavior:
+      the skip notice posts and the check stays green.
+    required: false
+    default: "fail"
+  settings:
+    description: >-
+      Fetch per-repo review settings from the OrcaRouter dashboard at the
+      start of each run. Set "false" to skip the fetch entirely and make this
+      workflow file authoritative: inputs (or their documented defaults)
+      apply as-is and no dashboard value can override them.
+    required: false
+    default: "true"
   report:
     description: >-
       Send a best-effort per-tier run summary (repo, PR number, head SHA, tier,
@@ -97,6 +116,25 @@ inputs:
 runs:
   using: "composite"
   steps:
+    # FIRST, before anything can read $RUNNER_TEMP: a reused self-hosted
+    # runner can carry a PREVIOUS run's files (a hard cancel can kill a job
+    # before its always() cleanup step gets to run). Clear everything this
+    # action writes there — above all policy-block.json, which the
+    # always()-running "Surface guardrail / firewall block" step trusts and
+    # would otherwise post as a false "merge is blocked" comment on a clean
+    # run whose cascade (and its own stale-file rm) never executed.
+    - name: Clear stale run files
+      shell: bash
+      run: |
+        rm -f "$RUNNER_TEMP/result.json" "$RUNNER_TEMP/review.log" \
+          "$RUNNER_TEMP/result-cheap.json" "$RUNNER_TEMP/result-strong.json" \
+          "$RUNNER_TEMP/result-posted.json" "$RUNNER_TEMP/result-extra.json" \
+          "$RUNNER_TEMP/result-merged.json" \
+          "$RUNNER_TEMP/cr-settings.json" "$RUNNER_TEMP/cr-rubric.md" \
+          "$RUNNER_TEMP/cr-facts.json" "$RUNNER_TEMP/proxy.out" "$RUNNER_TEMP/proxy.err" \
+          "$RUNNER_TEMP/policy-block.json" \
+          "$RUNNER_TEMP/pr.diff" "$RUNNER_TEMP/diff-guard.json" "$RUNNER_TEMP/prev-summary.md"
+
     - name: Resolve PR refs
       id: pr
       uses: actions/github-script@v7
@@ -151,6 +189,7 @@ runs:
       shell: bash
       env:
         SETTINGS_SCRIPT: ${{ github.action_path }}/scripts/settings.mjs
+        SETTINGS_ENABLED: ${{ inputs.settings }}
         ORCAROUTER_URL: ${{ inputs.orcarouter-url }}
         ORCAROUTER_API_KEY: ${{ inputs.orcarouter-api-key }}
         REPO: ${{ github.repository }}
@@ -161,6 +200,28 @@ runs:
         EVENT_NAME: ${{ github.event_name }}
         IS_DRAFT: ${{ steps.pr.outputs.is_draft }}
       run: |
+        # `settings: "false"` makes the workflow FILE authoritative: skip the
+        # fetch entirely, so inputs (or their documented defaults) apply as-is
+        # and no dashboard value can override them. (With the fetch on, an
+        # input left AT its documented default defers to the server — see the
+        # precedence rule below — so e.g. a deliberate `block-on: "P0,P1"` pin
+        # could still be overridden from the dashboard.)
+        if [ "$SETTINGS_ENABLED" = "false" ]; then
+          echo "settings: disabled via the 'settings' input — the workflow file is authoritative."
+          {
+            echo "auto_review=true"
+            echo "trigger=every_push"
+            echo "exhaustive=false"
+            echo "quiet=false"
+            echo "fix_first=$INPUT_FIX_FIRST"
+            echo "block_on=$INPUT_BLOCK_ON"
+            echo "rubric_file="
+            echo "decision=review"
+            echo "reason="
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
         node "$SETTINGS_SCRIPT" --url "$ORCAROUTER_URL" --key "$ORCAROUTER_API_KEY" \
           --repo "$REPO" --out "$SETTINGS_JSON"
 
@@ -195,21 +256,25 @@ runs:
         fi
 
         # Settings gate — composable with the diff guard's `decision != 'skip'`.
-        # Only AUTO runs (pull_request_target) are gated: an explicit
-        # `/orcarouter-review` comment command always proceeds — on-demand mode
-        # exists precisely for those, and a human asking for a review of a
-        # draft/disabled repo is deliberate.
+        # Only AUTO runs are gated — any pull_request* event, so a hand-written
+        # plain `pull_request` workflow honors dashboard gating exactly like
+        # the documented `pull_request_target` one. An explicit
+        # `/orcarouter-review` comment command (issue_comment) always proceeds —
+        # on-demand mode exists precisely for those, and a human asking for a
+        # review of a draft/disabled repo is deliberate.
         DECISION=review
         REASON=""
-        if [ "$EVENT_NAME" = "pull_request_target" ]; then
-          if [ "$AUTO_REVIEW" = "false" ]; then
-            DECISION=skip; REASON="auto-review is disabled in the OrcaRouter dashboard"
-          elif [ "$TRIGGER" = "on_demand" ]; then
-            DECISION=skip; REASON="on-demand mode"
-          elif [ "$TRIGGER" = "ready_for_review" ] && [ "$IS_DRAFT" = "true" ]; then
-            DECISION=skip; REASON="draft PR"
-          fi
-        fi
+        case "$EVENT_NAME" in
+          pull_request*)
+            if [ "$AUTO_REVIEW" = "false" ]; then
+              DECISION=skip; REASON="auto-review is disabled in the OrcaRouter dashboard"
+            elif [ "$TRIGGER" = "on_demand" ]; then
+              DECISION=skip; REASON="on-demand mode"
+            elif [ "$TRIGGER" = "ready_for_review" ] && [ "$IS_DRAFT" = "true" ]; then
+              DECISION=skip; REASON="draft PR"
+            fi
+            ;;
+        esac
         echo "settings: auto_review=$AUTO_REVIEW trigger=$TRIGGER exhaustive=$EXHAUSTIVE quiet=$QUIET fix_first=$FIX_FIRST block_on=$BLOCK_ON rubric=${RUBRIC_OUT:+custom} -> $DECISION ${REASON:+($REASON)}"
         {
           echo "auto_review=$AUTO_REVIEW"
@@ -324,8 +389,11 @@ runs:
         '
 
     # On "skip": explain on the PR (upserted — one notice, edited while pushes
-    # stay oversized), then PASS. No later step runs the engine or the gate, so
-    # the job (and a required check) goes green — a skip must not block merges.
+    # stay oversized), then apply `on-oversized-diff`. No later step runs the
+    # engine or the gate either way. Default "fail": the check goes RED — an
+    # unreviewed diff must not satisfy a required merge gate (padding a PR
+    # past max-diff-kb would otherwise bypass the P0/P1 gate entirely).
+    # "pass" restores the advisory behavior (notice + green check).
     - name: Skip review (diff too large)
       if: steps.guard.outputs.decision == 'skip'
       uses: actions/github-script@v7
@@ -337,18 +405,26 @@ runs:
         REASON: ${{ steps.guard.outputs.reason }}
         MAX_KB: ${{ inputs.max-diff-kb }}
         MAX_FILES: ${{ inputs.max-diff-files }}
+        ON_OVERSIZED: ${{ inputs.on-oversized-diff }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
           const brand = process.env.BRAND;
           const num = Number(process.env.PR_NUMBER);
           const repo = { owner: context.repo.owner, repo: context.repo.repo };
+          // Anything that is not an explicit "pass" fails the check (fail-safe).
+          const pass = process.env.ON_OVERSIZED === 'pass';
           // Own marker (distinct from the summary comment's): once the PR
-          // shrinks and reviews resume, the summary comment takes over.
+          // shrinks and reviews resume, the summary comment takes over (and
+          // deletes this notice).
           const MARKER = '<!-- orca-code-review-skip -->';
           const footer =
             `\n\n<sub>Reviewed via [OrcaRouter](https://orcarouter.ai) — ` +
             `Route Smarter. Ship Safer. Spend Less.</sub>`;
+          const outcome = pass
+            ? `and the check **passes** (\`on-oversized-diff: "pass"\`), so this skip does not block your merge.`
+            : `and the check **fails** (\`on-oversized-diff: "fail"\`, the default), so an unreviewed ` +
+              `diff cannot slip through a required merge gate.`;
           const body =
             `${MARKER}\n## 🐳 ${brand}\n\n` +
             `⏭️ **Review skipped — this PR's diff is too large** (${process.env.REASON}).\n\n` +
@@ -356,10 +432,10 @@ runs:
             `| Diff size | ${process.env.SIZE_KB} KB | ${process.env.MAX_KB} KB |\n` +
             `| Files touched | ${process.env.FILES} | ${process.env.MAX_FILES} |\n\n` +
             `The review engine was **not** run — reviews of very large diffs truncate and ` +
-            `lose signal — and the check **passes**, so this never blocks your merge.\n\n` +
-            `**Want it reviewed anyway?** Raise the limits on the action:\n\n` +
-            '```yaml\nwith:\n  max-diff-kb: "1024"    # default 512\n  max-diff-files: "500"  # default 300\n```\n\n' +
-            `Or split the PR — smaller diffs get much higher-signal reviews.` +
+            `lose signal — ${outcome}\n\n` +
+            `**What now?** Split the PR (smaller diffs get much higher-signal reviews), raise ` +
+            `the limits, or make skips advisory:\n\n` +
+            '```yaml\nwith:\n  max-diff-kb: "1024"        # default 512\n  max-diff-files: "500"      # default 300\n  on-oversized-diff: "pass"  # default "fail"\n```' +
             footer;
 
           const comments = await github.paginate(github.rest.issues.listComments, {
@@ -373,7 +449,15 @@ runs:
           }
 
           await core.summary.addRaw(`skipped: diff too large (${process.env.REASON})`).write();
-          core.notice(`${brand}: review skipped — ${process.env.REASON}`);
+          if (pass) {
+            core.notice(`${brand}: review skipped — ${process.env.REASON}`);
+          } else {
+            core.setFailed(
+              `${brand}: review skipped — ${process.env.REASON}. Failing the check so the merge ` +
+              `gate cannot be bypassed by an oversized diff: raise max-diff-kb / max-diff-files, ` +
+              `split the PR, or set on-oversized-diff: "pass" to make skips advisory.`,
+            );
+          }
 
     - name: Install review engine
       if: steps.settings.outputs.decision != 'skip' && steps.guard.outputs.decision != 'skip'
@@ -453,17 +537,22 @@ runs:
         # Start the in-job fact-injecting proxy (loopback, ephemeral). OCR can't
         # send custom headers; the proxy stamps x-cr-* facts (from $FACTS_FILE,
         # re-read per request) so the router's DSL can route on them.
+        # Pre-create the output files: the backgrounded node opens proxy.out
+        # asynchronously, and under `set -e` a first-iteration `sed` on a
+        # not-yet-created file would kill the whole step with no diagnostics.
         echo '{}' > "$FACTS_FILE"
+        : > "$RUNNER_TEMP/proxy.out"
+        : > "$RUNNER_TEMP/proxy.err"
         CR_FACTS_FILE="$FACTS_FILE" CR_POLICY_BLOCK_FILE="$POLICY_BLOCK" node "$PROXY" > "$RUNNER_TEMP/proxy.out" 2> "$RUNNER_TEMP/proxy.err" &
         PROXY_PID=$!
         trap 'kill "$PROXY_PID" 2>/dev/null || true' EXIT
         for _ in $(seq 1 50); do
-          OCR_LLM_URL=$(sed -n 's/^PROXY_URL=//p' "$RUNNER_TEMP/proxy.out")
+          OCR_LLM_URL=$(sed -n 's/^PROXY_URL=//p' "$RUNNER_TEMP/proxy.out" 2>/dev/null || true)
           [ -n "$OCR_LLM_URL" ] && break
           sleep 0.1
         done
         if [ -z "$OCR_LLM_URL" ]; then
-          echo "::error::$BRAND: fact proxy failed to start."; cat "$RUNNER_TEMP/proxy.err"; exit 1
+          echo "::error::$BRAND: fact proxy failed to start."; cat "$RUNNER_TEMP/proxy.err" || true; exit 1
         fi
         export OCR_LLM_URL
 
@@ -504,12 +593,18 @@ runs:
           node "$CHECK" "$1" "$rc"
         }
 
-        # One TIER: the mandatory first pass, then — exhaustive mode only —
-        # up to 2 extra engine passes over the same diff (LLM reviews aren't
-        # exhaustive in one pass), each deduped into $RESULT by
-        # exhaustive-merge.mjs; the loop ends as soon as a pass adds nothing
-        # new. PASSES counts this tier's passes for the summary comment.
-        #   $1 = log label, $2 = prev tier fact, $3 = prev fix-first fact
+        # One TIER: the mandatory first pass, then — exhaustive mode, on the
+        # STRONG (enforced) tier only — up to 2 extra engine passes over the
+        # same diff (LLM reviews aren't exhaustive in one pass), each deduped
+        # into $RESULT by exhaustive-merge.mjs. Cheap-tier extras would be
+        # waste: a clear cheap pass escalates and the same-run strong review
+        # supersedes it, and a held one wants its fix-first findings fixed
+        # before more depth. The loop also stops as soon as a fix-first
+        # finding is in hand — the gate blocks on what we already have — or a
+        # pass adds nothing new. So the enforced tier runs at most 3 engine
+        # passes total. PASSES counts this tier's passes for the summary.
+        #   $1 = log label, $2 = prev tier fact, $3 = prev fix-first fact,
+        #   $4 = extra passes allowed (true only on the strong tier)
         run_review() {
           if ! run_pass "$RESULT" "$1" "$2" "$3"; then
             echo "::error::$BRAND: review engine produced no usable result — failing closed."
@@ -517,7 +612,12 @@ runs:
           fi
           PASSES=1
           [ "$EXHAUSTIVE" = "true" ] || return 0
+          [ "$4" = "true" ] || return 0
           for extra in 2 3; do
+            if node "$GATE" "$RESULT" --has "$FIX_FIRST"; then
+              echo "exhaustive: $FIX_FIRST finding(s) already in hand — skipping further passes (fix those first)."
+              break
+            fi
             if ! run_pass "$RESULT_EXTRA" "$1 — exhaustive pass $extra" "$2" "$3"; then
               echo "::warning::$BRAND: exhaustive pass $extra produced no usable result — keeping the findings so far."
               break
@@ -548,11 +648,11 @@ runs:
         HELD=false
         PASSES=1
         if [ "$TIER_STATE" = "1" ]; then
-          run_review "strong tier (promoted)" "strong" "false"
+          run_review "strong tier (promoted)" "strong" "false" true
           cp "$RESULT" "$RESULT_STRONG"
           echo "strong_ran=true" >> "$GITHUB_OUTPUT"
         else
-          run_review "cheap tier" "cheap" "true"
+          run_review "cheap tier" "cheap" "true" false
           cp "$RESULT" "$RESULT_CHEAP"
           if node "$GATE" "$RESULT" --has "$FIX_FIRST"; then
             echo "Cheap tier found $FIX_FIRST — holding the strong tier until those are fixed."
@@ -561,7 +661,7 @@ runs:
           else
             echo "Cheap tier clear of $FIX_FIRST — escalating to the strong tier now."
             echo "cheap_gate=pass" >> "$GITHUB_OUTPUT"
-            run_review "strong tier (escalation)" "cheap" "false"
+            run_review "strong tier (escalation)" "cheap" "false" true
             cp "$RESULT" "$RESULT_STRONG"
             echo "strong_ran=true" >> "$GITHUB_OUTPUT"
             PROMOTE=true
@@ -839,6 +939,19 @@ runs:
           });
           const existing = comments.find((c) => c.body && c.body.includes(MARKER));
 
+          // A real review ran, so retire stale skip notices (best-effort): the
+          // "automatic review is off" and "diff too large" comments would
+          // otherwise outlive the condition they describe once reviews resume.
+          for (const stale of ['<!-- orca-code-review-disabled -->', '<!-- orca-code-review-skip -->']) {
+            const notice = comments.find((c) => c.body && c.body.includes(stale));
+            if (!notice) continue;
+            try {
+              await github.rest.issues.deleteComment({ ...repo, comment_id: notice.id });
+            } catch (e) {
+              console.log(`Could not delete a stale skip notice (${stale}):`, e.message);
+            }
+          }
+
           // Feed the previous body back for the Δ column and number this push
           // from its machine state (first summary = push 1).
           const args = [process.env.SUMMARY_SCRIPT, process.env.RESULT];
@@ -863,6 +976,10 @@ runs:
           }
           const tier = process.env.STRONG_RAN === 'true' ? 'strong' : 'cheap';
           args.push('--tier', tier, '--push', String(push), '--gate', blocked ? 'blocked' : 'pass');
+          // The ❌ line counts findings against the EFFECTIVE block-on set
+          // (dashboard/input precedence already applied) — an empty string is
+          // a deliberate "block on nothing" and passes through as-is.
+          args.push('--block-on', process.env.BLOCK_ON ?? 'P0,P1');
           // Mode notes: exhaustive pass count (renders only when > 1) and the
           // quiet-mode explainer next to the true counts.
           args.push('--passes', process.env.PASSES || '1');

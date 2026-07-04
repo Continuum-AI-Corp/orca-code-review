@@ -3,7 +3,7 @@
 //
 //   node summary-comment.mjs <result.json> --tier cheap|strong --push <n>
 //     --gate pass|blocked [--prev <file with the previous comment body>]
-//     [--passes <n>] [--quiet]
+//     [--passes <n>] [--quiet] [--block-on P0,P1]
 //
 // Prints the comment MARKDOWN to stdout. The driver (action.yml) UPSERTS it:
 // it finds the existing PR comment via the marker line, updates it in place,
@@ -29,9 +29,11 @@
 //
 // Severity counts use the shared severity.mjs (leading tag, untagged->P1
 // fail-safe) — the same numbers the gate and the run report see. The gate
-// line's blocking COUNT assumes the default block-on set (P0+P1); the
-// pass/blocked verdict itself always comes from --gate, which the driver
-// computes with the real configuration.
+// line's blocking COUNT is computed over the `--block-on` set (default
+// "P0,P1"; the driver passes the effective, dashboard-aware value, so a repo
+// blocking on P2 sees its P2 count, not a hardcoded P0+P1). The pass/blocked
+// verdict itself always comes from --gate, which the driver computes with the
+// same configuration.
 
 import fs from "node:fs";
 import { SEVERITIES, countSeverities } from "./severity.mjs";
@@ -42,13 +44,13 @@ const STATE_RE = /<!-- orca-cr-state: (\{.*?\}) -->/;
 const usage = () => {
   console.error(
     "usage: node summary-comment.mjs <result.json> --tier cheap|strong --push <n> " +
-      "--gate pass|blocked [--prev <file>] [--passes <n>] [--quiet]",
+      "--gate pass|blocked [--prev <file>] [--passes <n>] [--quiet] [--block-on P0,P1]",
   );
   process.exit(2);
 };
 
 const [file, ...rest] = process.argv.slice(2);
-const opts = { passes: "1" };
+const opts = { passes: "1", blockOn: "P0,P1" };
 for (let i = 0; i < rest.length; i += 1) {
   if (rest[i] === "--tier") opts.tier = rest[++i];
   else if (rest[i] === "--push") opts.push = rest[++i];
@@ -56,9 +58,17 @@ for (let i = 0; i < rest.length; i += 1) {
   else if (rest[i] === "--prev") opts.prev = rest[++i];
   else if (rest[i] === "--passes") opts.passes = rest[++i];
   else if (rest[i] === "--quiet") opts.quiet = true;
+  else if (rest[i] === "--block-on") opts.blockOn = rest[++i];
 }
 const push = Number(opts.push);
 const passes = Number(opts.passes);
+// The block-on set the ❌ count is computed over. Same normalization as the
+// settings/gate machinery: trim + uppercase, empty = "block on nothing"
+// (valid — the verdict then always comes from --gate as "pass").
+const blockOn = String(opts.blockOn ?? "")
+  .split(",")
+  .map((s) => s.trim().toUpperCase())
+  .filter(Boolean);
 if (
   !file ||
   !["cheap", "strong"].includes(opts.tier) ||
@@ -66,7 +76,8 @@ if (
   !Number.isInteger(push) ||
   push < 1 ||
   !Number.isInteger(passes) ||
-  passes < 1
+  passes < 1 ||
+  blockOn.some((s) => !SEVERITIES.includes(s))
 ) {
   usage();
 }
@@ -123,7 +134,7 @@ if (passes > 1) lines.push(`exhaustive: ${passes} passes`);
 if (opts.quiet) lines.push("quiet mode: P2 shown in summary only");
 lines.push("");
 
-const blocking = counts.P0 + counts.P1;
+const blocking = blockOn.reduce((n, s) => n + counts[s], 0);
 lines.push(
   opts.gate === "blocked"
     ? `❌ ${blocking} finding${blocking === 1 ? "" : "s"} block${blocking === 1 ? "s" : ""} merge`

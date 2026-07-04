@@ -10,7 +10,7 @@
 // `diff --git` headers. AT a limit still reviews; only strictly-over skips.
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -70,7 +70,10 @@ describe("size threshold (--max-kb)", () => {
     const out = run(["--diff", writeDiff(content), "--max-kb", "1"]);
     assert.equal(out.decision, "skip");
     assert.match(out.reason, /over the 1 KB limit/);
-    assert.equal(out.files, 1);
+    // The size decision short-circuits on stat alone — an oversized diff is
+    // never read into memory, so no file count is computed.
+    assert.equal(out.files, 0);
+    assert.ok(out.size_kb > 0, "the stat-derived size is still reported");
   });
 });
 
@@ -124,6 +127,31 @@ describe("defaults (512 KB / 300 files)", () => {
   test("a non-numeric limit falls back to its default instead of crashing", () => {
     const out = run(["--diff", writeDiff(fileBlock(1)), "--max-kb", "banana"]);
     assert.equal(out.decision, "review");
+  });
+});
+
+describe("action.yml wiring (oversized-diff outcome)", () => {
+  const actionYml = () =>
+    readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "action.yml"), "utf8");
+
+  test("`on-oversized-diff` defaults to \"fail\" — a padded diff cannot bypass a required merge gate", () => {
+    const yml = actionYml();
+    const inputs = yml.slice(yml.indexOf("inputs:"), yml.indexOf("runs:"));
+    const declaration = inputs.slice(inputs.indexOf("on-oversized-diff:"));
+    assert.ok(declaration.length > 0, "the on-oversized-diff input must be declared");
+    assert.match(
+      declaration.slice(0, declaration.indexOf("settings:")),
+      /default: "fail"/,
+      "the default outcome must be fail (secure by default)",
+    );
+  });
+
+  test("the skip step consumes the input and fails the check unless it is exactly \"pass\"", () => {
+    const yml = actionYml();
+    const skip = yml.slice(yml.indexOf("- name: Skip review (diff too large)"), yml.indexOf("- name: Install review engine"));
+    assert.match(skip, /ON_OVERSIZED/, "the step must receive the input");
+    assert.match(skip, /=== 'pass'/, "anything but an explicit pass fails (fail-safe)");
+    assert.match(skip, /setFailed/, "fail mode must fail the check");
   });
 });
 

@@ -15,7 +15,7 @@
 // stderr for the CI log.
 
 import fs from "node:fs";
-import { severityOf } from "./severity.mjs";
+import { SEVERITIES, severityOf } from "./severity.mjs";
 
 const [file, flag, listRaw] = process.argv.slice(2);
 
@@ -54,7 +54,7 @@ for (const c of comments) {
 }
 
 const breakdown =
-  ["P0", "P1", "P2"]
+  SEVERITIES
     .filter((s) => counts[s])
     .map((s) => `${counts[s]} ${s}`)
     .join(", ") || "none";

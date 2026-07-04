@@ -32,6 +32,7 @@
 // server says.
 
 import fs from "node:fs";
+import { SEVERITIES } from "./severity.mjs";
 
 const TIMEOUT_MS = 5000;
 const RETRY_PAUSE_MS = 500;
@@ -58,7 +59,7 @@ function normalizeSeverityList(v) {
     .split(",")
     .map((s) => s.trim().toUpperCase())
     .filter(Boolean);
-  if (tokens.some((t) => !["P0", "P1", "P2"].includes(t))) return null;
+  if (tokens.some((t) => !SEVERITIES.includes(t))) return null;
   return tokens.join(",");
 }
 

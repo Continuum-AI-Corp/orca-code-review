@@ -134,6 +134,47 @@ describe("gate line", () => {
     const out = run(["[P2] nit"], ["--tier", "strong", "--push", "1", "--gate", "pass"]);
     assert.ok(out.includes("✅ no blocking findings"));
   });
+
+  test("--block-on P2: the blocking count follows the configured set, not a hardcoded P0+P1", () => {
+    const out = run(
+      ["[P0] a", "[P2] b", "[P2] c"],
+      ["--tier", "strong", "--push", "1", "--gate", "blocked", "--block-on", "P2"],
+    );
+    assert.ok(out.includes("❌ 2 findings block merge"), `got:\n${out}`);
+  });
+
+  test("--block-on accepts a CSV set and normalizes case/whitespace", () => {
+    const out = run(
+      ["[P1] a", "[P2] b", "[P2] c"],
+      ["--tier", "strong", "--push", "1", "--gate", "blocked", "--block-on", " p1 , p2 "],
+    );
+    assert.ok(out.includes("❌ 3 findings block merge"));
+  });
+
+  test("an empty --block-on ('block on nothing') renders the ✅ pass wording", () => {
+    const out = run(
+      ["[P0] a", "[P1] b"],
+      ["--tier", "strong", "--push", "1", "--gate", "pass", "--block-on", ""],
+    );
+    assert.ok(out.includes("✅ no blocking findings"));
+  });
+
+  test("no --block-on keeps the default P0+P1 count (back-compat)", () => {
+    const out = run(
+      ["[P0] a", "[P1] b", "[P1] c", "[P2] d"],
+      ["--tier", "strong", "--push", "1", "--gate", "blocked"],
+    );
+    assert.ok(out.includes("❌ 3 findings block merge"));
+  });
+
+  test("an unknown severity in --block-on exits 2 — a wiring bug must be loud", () => {
+    const r = spawnSync(
+      "node",
+      [SUMMARY, join(dir, "x.json"), "--tier", "strong", "--push", "1", "--gate", "pass", "--block-on", "P0,P5"],
+      { encoding: "utf8" },
+    );
+    assert.equal(r.status, 2);
+  });
 });
 
 describe("mode notes (exhaustive / quiet)", () => {

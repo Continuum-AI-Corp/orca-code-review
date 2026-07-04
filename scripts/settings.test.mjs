@@ -383,4 +383,37 @@ describe("action.yml wiring (settings, quiet mode)", () => {
     assert.match(gate, /\/result\.json/, "the gate must read the unfiltered result");
     assert.doesNotMatch(gate, /result-posted\.json/, "the gate must NOT read the filtered result");
   });
+
+  test("the summary step passes the EFFECTIVE block-on set to summary-comment.mjs", () => {
+    const yml = actionYml();
+    const summary = yml.slice(yml.indexOf("- name: Summary comment"), yml.indexOf("- name: Enforce severity gate"));
+    assert.match(summary, /--block-on/, "the ❌ count must follow the configured block-on set, not a hardcoded P0+P1");
+    assert.match(summary, /steps\.settings\.outputs\.block_on/, "and it must be the settings-aware effective value");
+  });
+
+  test("a `settings` input (default \"true\") can disable the dashboard fetch — workflow file authoritative", () => {
+    const yml = actionYml();
+    const inputs = yml.slice(yml.indexOf("inputs:"), yml.indexOf("runs:"));
+    assert.match(inputs, /\n {2}settings:\n/, "the settings input must be declared");
+    assert.match(yml, /SETTINGS_ENABLED/, "the fetch step must consume the input");
+    const fetch = yml.slice(yml.indexOf("- name: Fetch review settings"), yml.indexOf("- name: Skip review (settings)"));
+    assert.match(fetch, /"\$SETTINGS_ENABLED" = "false"/, "settings=false must short-circuit the fetch");
+    assert.match(fetch, /decision=review/, "the short-circuit must still emit decision=review");
+  });
+
+  test("dashboard gating applies to any pull_request* event, not just pull_request_target", () => {
+    const fetch = actionYml().slice(
+      actionYml().indexOf("- name: Fetch review settings"),
+      actionYml().indexOf("- name: Skip review (settings)"),
+    );
+    assert.match(fetch, /pull_request\*\)/, "a plain pull_request workflow must honor auto_review/trigger too");
+  });
+
+  test("a resumed review retires the stale settings-skip and oversized-skip notices", () => {
+    const yml = actionYml();
+    const summary = yml.slice(yml.indexOf("- name: Summary comment"), yml.indexOf("- name: Enforce severity gate"));
+    assert.match(summary, /orca-code-review-disabled/, "the 'auto review off' notice must be cleaned up");
+    assert.match(summary, /orca-code-review-skip/, "the 'diff too large' notice must be cleaned up");
+    assert.match(summary, /deleteComment/, "cleanup means deleting the stale comment");
+  });
 });
