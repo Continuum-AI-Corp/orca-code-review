@@ -73,6 +73,20 @@ inputs:
     description: "Severities that fail the check (block the merge)."
     required: false
     default: "P0,P1"
+  auto-review-authors:
+    description: >-
+      Comma-separated GitHub author-association allowlist for AUTOMATIC
+      reviews (pull_request events). Empty = review everyone (default). On a
+      PUBLIC repo, pull_request_target bypasses GitHub's fork-approval gate
+      and the review key is wallet-metered, so an external user can trigger
+      paid cascades by opening PRs — set e.g.
+      "OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR" to auto-review only known
+      contributors (others can still be reviewed on demand via
+      /orcarouter-review). Also set a wallet budget + alert on the key.
+      Case-insensitive; values: OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR,
+      FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, MANNEQUIN, NONE.
+    required: false
+    default: ""
   max-diff-kb:
     description: >-
       Skip the review when the PR's merge-base diff is bigger than this many
@@ -141,12 +155,13 @@ runs:
       with:
         github-token: ${{ inputs.github-token }}
         script: |
-          let base, headSha, num, isDraft;
+          let base, headSha, num, isDraft, authorAssoc;
           if (context.eventName === 'pull_request_target') {
             base = context.payload.pull_request.base.ref;
             headSha = context.payload.pull_request.head.sha;
             num = context.payload.pull_request.number;
             isDraft = context.payload.pull_request.draft === true;
+            authorAssoc = context.payload.pull_request.author_association || 'NONE';
           } else {
             num = context.issue.number;
             const { data: pr } = await github.rest.pulls.get({
@@ -154,6 +169,7 @@ runs:
             });
             base = pr.base.ref; headSha = pr.head.sha;
             isDraft = pr.draft === true;
+            authorAssoc = pr.author_association || 'NONE';
           }
           core.setOutput('base', base);
           core.setOutput('head_sha', headSha);
@@ -161,6 +177,12 @@ runs:
           // Draft state feeds the settings gate: trigger=ready_for_review
           // skips auto-reviews while the PR is still a draft.
           core.setOutput('is_draft', String(isDraft));
+          // PR author's association gates auto-review spend on public repos:
+          // pull_request_target bypasses GitHub's fork-approval gate, so the
+          // `auto-review-authors` allowlist can restrict which associations
+          // trigger a paid auto-review (comment commands stay maintainer-gated
+          // in the workflow `if:`).
+          core.setOutput('author_association', authorAssoc);
 
           // Stateful tier: the PR carries an `orca-review:strong` label once it
           // has been promoted to the strong model. No label means it is still on
@@ -199,6 +221,8 @@ runs:
         INPUT_BLOCK_ON: ${{ inputs.block-on }}
         EVENT_NAME: ${{ github.event_name }}
         IS_DRAFT: ${{ steps.pr.outputs.is_draft }}
+        AUTHOR_ASSOC: ${{ steps.pr.outputs.author_association }}
+        AUTO_REVIEW_AUTHORS: ${{ inputs.auto-review-authors }}
       run: |
         # `settings: "false"` makes the workflow FILE authoritative: skip the
         # fetch entirely, so inputs (or their documented defaults) apply as-is
@@ -222,7 +246,7 @@ runs:
           exit 0
         fi
 
-        node "$SETTINGS_SCRIPT" --url "$ORCAROUTER_URL" --key "$ORCAROUTER_API_KEY" \
+        node "$SETTINGS_SCRIPT" --url "$ORCAROUTER_URL" \
           --repo "$REPO" --out "$SETTINGS_JSON"
 
         # Read one validated field from the settings file; $2 is the fallback
@@ -272,6 +296,13 @@ runs:
               DECISION=skip; REASON="on-demand mode"
             elif [ "$TRIGGER" = "ready_for_review" ] && [ "$IS_DRAFT" = "true" ]; then
               DECISION=skip; REASON="draft PR"
+            elif [ -n "$AUTO_REVIEW_AUTHORS" ] && \
+                 ! printf '%s' ",$AUTO_REVIEW_AUTHORS," | grep -qi ",$AUTHOR_ASSOC,"; then
+              # Spend guard for public repos: only auto-review PRs whose author
+              # association is in the allowlist. Empty allowlist = review
+              # everyone (default, preserves behavior). Maintainer comment
+              # commands are unaffected (gated in the workflow `if:`).
+              DECISION=skip; REASON="author association $AUTHOR_ASSOC not in auto-review-authors"
             fi
             ;;
         esac
@@ -1038,7 +1069,7 @@ runs:
         node "$REPORT" "$RESULT_CHEAP" \
           --repo "$REPO" --pr "$PR_NUMBER" --sha "$HEAD_SHA" \
           --tier cheap --gate "$CHEAP_GATE" \
-          --url "$ORCAROUTER_URL" --key "$ORCAROUTER_API_KEY" \
+          --url "$ORCAROUTER_URL" \
           --engine-version "$ENGINE_VERSION"
 
     - name: Report run (strong tier)
@@ -1063,7 +1094,7 @@ runs:
         node "$REPORT" "$RESULT_STRONG" \
           --repo "$REPO" --pr "$PR_NUMBER" --sha "$HEAD_SHA" \
           --tier strong --gate "$GATE_RESULT" \
-          --url "$ORCAROUTER_URL" --key "$ORCAROUTER_API_KEY" \
+          --url "$ORCAROUTER_URL" \
           --engine-version "$ENGINE_VERSION"
 
     - name: Clean up engine output

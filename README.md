@@ -133,6 +133,7 @@ All optional — pass as `with:` inputs on the action:
 | `max-diff-files` | `300` | Skip the review (same notice + `on-oversized-diff` outcome) when the diff touches more than this many files |
 | `on-oversized-diff` | `fail` | What an oversized-diff skip does to the check: `fail` (default) fails it, so a diff padded past the limits can never bypass a required merge gate; `pass` makes skips advisory (notice + green check) |
 | `settings` | `true` | Fetch per-repo settings from the OrcaRouter dashboard on every run; set `"false"` to skip the fetch and make the workflow file authoritative (inputs/defaults apply as-is, no dashboard override) |
+| `auto-review-authors` | `""` (everyone) | Comma-separated author-association allowlist for **automatic** reviews. Empty reviews every PR. On a **public** repo, set e.g. `OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR` so anonymous fork PRs can't drain your wallet with paid cascades (they can still be reviewed on demand via `/orcarouter-review`). See [Public repos & spend](#public-repos--spend). |
 | `report` | `true` | Send a per-run summary (severity counts only — never code) to the OrcaRouter control plane; set `"false"` to disable — see [Run reporting](#run-reporting) |
 
 `fix-first` and `block-on` can also be set per-repo from the OrcaRouter

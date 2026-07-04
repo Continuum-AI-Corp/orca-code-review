@@ -137,15 +137,18 @@ async function main() {
   const opts = {};
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--url") opts.url = argv[++i];
-    else if (argv[i] === "--key") opts.key = argv[++i];
     else if (argv[i] === "--repo") opts.repo = argv[++i];
     else if (argv[i] === "--out") opts.out = argv[++i];
   }
+  // The API key comes from the environment, NEVER argv: a --key flag would
+  // land in /proc/<pid>/cmdline and `ps aux` (world-readable on Linux), a
+  // real leak on shared/self-hosted runners.
+  opts.key = process.env.ORCAROUTER_API_KEY;
 
   let settings;
   if (!opts.url || !opts.key || !opts.repo || !opts.out) {
     console.error(
-      "settings: usage: node settings.mjs --url U --key K --repo owner/name --out path.json " +
+      "settings: usage: ORCAROUTER_API_KEY=<key> node settings.mjs --url U --repo owner/name --out path.json " +
         "(fail-open — printing built-in defaults and exiting 0)",
     );
     settings = { ...DEFAULTS };

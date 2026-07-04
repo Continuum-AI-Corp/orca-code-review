@@ -36,13 +36,15 @@ async function main() {
     else if (rest[i] === "--tier") opts.tier = rest[++i];
     else if (rest[i] === "--gate") opts.gate = rest[++i];
     else if (rest[i] === "--url") opts.url = rest[++i];
-    else if (rest[i] === "--key") opts.key = rest[++i];
     else if (rest[i] === "--engine-version") opts.engineVersion = rest[++i];
   }
+  // Key from the environment, NEVER argv (a --key flag leaks via
+  // /proc/<pid>/cmdline and `ps aux` on shared/self-hosted runners).
+  opts.key = process.env.ORCAROUTER_API_KEY;
   if (!file || !opts.repo || !opts.pr || !opts.sha || !opts.tier || !opts.gate || !opts.url || !opts.key) {
     console.error(
-      "report: usage: node report.mjs <result.json> --repo X --pr N --sha S " +
-        "--tier cheap|strong --gate pass|blocked --url U --key K [--engine-version V] " +
+      "report: usage: ORCAROUTER_API_KEY=<key> node report.mjs <result.json> --repo X --pr N --sha S " +
+        "--tier cheap|strong --gate pass|blocked --url U [--engine-version V] " +
         "(best-effort — exiting 0)",
     );
     return;

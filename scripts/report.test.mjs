@@ -66,7 +66,10 @@ function writeResult(contents) {
 // so the test's event loop must stay live to answer the child's request.
 function runReport(args) {
   return new Promise((resolve) => {
-    const child = spawn("node", [REPORT, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("node", [REPORT, ...args], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ORCAROUTER_API_KEY: "test-key-123" },
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (c) => (stdout += c));
@@ -86,7 +89,6 @@ const baseArgs = (file, port, extra = []) => [
   "--tier", "cheap",
   "--gate", "blocked",
   "--url", `http://127.0.0.1:${port}/v1/chat/completions`,
-  "--key", "test-key-123",
   ...extra,
 ];
 

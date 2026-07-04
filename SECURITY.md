@@ -27,6 +27,24 @@ guardrail attached, prompt-injection/jailbreak rails run server-side on every
 request, and a guardrail **block** fails the check closed with the reason
 posted to the PR (the diff never reached the model).
 
+### Public repos & spend
+
+On a **public** repository the recommended `pull_request_target` trigger runs
+the review for fork PRs, and `pull_request_target` bypasses GitHub's built-in
+"require approval to run workflows from fork PRs" gate. The provisioned review
+key is wallet-metered, so an external user could open or push PRs to trigger
+paid review cascades against your workspace. Two backstops, both recommended
+for public repos:
+
+- **Set a wallet budget with alerts** on the `code-review` key (the console's
+  one-click setup provisions the key; add the budget on the Keys page). This
+  is the hard spend ceiling and is **mandatory** for public repos.
+- **Restrict auto-review authors** with the `auto-review-authors` input (e.g.
+  `OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR`) so anonymous/first-time PRs are not
+  auto-reviewed. They can still be reviewed on demand by a maintainer's
+  `/orcarouter-review` comment, which is separately gated to
+  OWNER/MEMBER/COLLABORATOR.
+
 ### `pull_request_target` and secrets
 
 The recommended workflow uses `pull_request_target` so `ORCAROUTER_API_KEY`
@@ -56,7 +74,9 @@ Use a dedicated workspace API key for review (the console's one-click setup
 provisions one named `code-review` with `environment=ci`): attach a guardrail,
 set a monthly budget with alerts, and scope it to nothing else. Rotate from
 the Keys page; the key is a repository secret and never appears in logs or
-comments.
+comments. Internally the action passes it to its helper scripts through the
+environment, never as a command-line argument, so it does not surface in
+`/proc/<pid>/cmdline` or `ps` output on shared/self-hosted runners.
 
 ### Supply chain
 

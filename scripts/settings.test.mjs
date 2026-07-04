@@ -73,7 +73,10 @@ const envelope = (data) => ({ success: true, message: "", data });
 // test's event loop must stay live to answer the child's request.
 function run(script, args) {
   return new Promise((resolve) => {
-    const child = spawn("node", [script, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("node", [script, ...args], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ORCAROUTER_API_KEY: "test-key-123" },
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (c) => (stdout += c));
@@ -88,7 +91,6 @@ function outPath() {
 
 const baseArgs = (port, out) => [
   "--url", `http://127.0.0.1:${port}/v1/chat/completions`,
-  "--key", "test-key-123",
   "--repo", "acme/widgets",
   "--out", out,
 ];
@@ -205,7 +207,7 @@ describe("settings: fail-open to defaults (must never kill reviews)", () => {
   test("bad --url -> defaults, exit 0 (still written to --out)", async () => {
     const out = outPath();
     const r = await run(SETTINGS, [
-      "--url", "not a url", "--key", "k", "--repo", "a/b", "--out", out,
+      "--url", "not a url", "--repo", "a/b", "--out", out,
     ]);
     assert.equal(r.status, 0);
     assert.deepEqual(JSON.parse(readFileSync(out, "utf8")), DEFAULTS);
