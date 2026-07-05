@@ -19,8 +19,10 @@ on:
   # `synchronize` re-reviews on every new push — the per-commit review loop. The
   # cascade escalates to the strong tier within a single run (no label-triggered
   # re-run needed — and a GITHUB_TOKEN label change can't trigger one anyway).
+  # `ready_for_review` makes the dashboard's trigger=ready_for_review mode fire
+  # when a draft PR becomes ready (drafts are skipped in that mode).
   pull_request_target:
-    types: [opened, synchronize]
+    types: [opened, synchronize, ready_for_review]
   issue_comment:
     types: [created]
 
@@ -53,3 +55,8 @@ jobs:
           # router: "orcarouter/code-review"  # router whose DSL picks the model per tier
           # fix-first: "P0,P1"   # withhold the strong tier until these are fixed
           # block-on: "P0"       # fail the check (block merge) on these
+          # max-diff-kb: "512"   # bigger diffs skip the review (outcome: on-oversized-diff)
+          # max-diff-files: "300"  # same skip when the diff touches more files than this
+          # on-oversized-diff: "fail"  # oversized skip fails the check; "pass" makes it advisory
+          # settings: "true"     # "false" skips the dashboard fetch — this file is authoritative
+          # report: "true"       # per-run severity counts (never code) to your control plane
