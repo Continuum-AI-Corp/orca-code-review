@@ -101,7 +101,7 @@ function validateSettings(data) {
 async function fetchOnce(endpoint, key) {
   const res = await fetch(endpoint, {
     method: "GET",
-    headers: { authorization: `Bearer ${key}` },
+    headers: { authorization: `Bearer ${key}`, "user-agent": "orca-code-review" },
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);

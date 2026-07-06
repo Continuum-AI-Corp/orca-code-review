@@ -611,6 +611,11 @@ describe("CLI contract (unchanged by the retry refactor)", () => {
       assert.equal(res.body, '{"ok":true}');
       assert.equal(res.headers["x-cr-retry-count"], "0", "success responses carry retry count 0");
       assert.equal(upstream.seen[0].headers["x-cr-prev-tier"], "strong");
+      assert.equal(
+        upstream.seen[0].headers["user-agent"],
+        "orca-code-review",
+        "relay traffic is attributed to OrcaRouter Code Review, not the OCR engine's default UA",
+      );
     } finally {
       child.kill();
       await upstream.close();

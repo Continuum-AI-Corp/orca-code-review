@@ -179,6 +179,11 @@ export function createProxyServer({
     const headers = { ...req.headers };
     delete headers.host; // must match upstream, not the loopback proxy
     Object.assign(headers, readFacts(factsFile));
+    // Identify the relay traffic to the gateway as OrcaRouter Code Review, not
+    // the underlying OCR engine's default User-Agent — so the gateway's request
+    // logs / client-app attribution show the product. Set AFTER the spread so it
+    // overrides whatever the engine sent.
+    headers["user-agent"] = "orca-code-review";
     const target = new URL(req.url, upstream);
 
     // The upstream request currently in flight for THIS client request (the

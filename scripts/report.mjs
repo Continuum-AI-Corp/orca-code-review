@@ -87,7 +87,11 @@ async function main() {
     try {
       const res = await fetch(endpoint, {
         method: "POST",
-        headers: { authorization: `Bearer ${opts.key}`, "content-type": "application/json" },
+        headers: {
+          authorization: `Bearer ${opts.key}`,
+          "content-type": "application/json",
+          "user-agent": "orca-code-review",
+        },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
