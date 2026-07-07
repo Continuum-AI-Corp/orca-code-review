@@ -1,13 +1,10 @@
-# OrcaRouter Code Review
+# Orca-Code-Review
 
 AI pull-request review powered by the [OrcaRouter](https://orcarouter.ai) model
 gateway. A cheap model screens every push; once a push comes back clear of
 serious (P0/P1) issues, a strong model makes the final pass. Findings post as
 inline PR comments, tagged by severity, and a configurable gate can block the
 merge.
-
-> Review engine powered by [Open Code Review](https://github.com/alibaba/open-code-review)
-> (Apache-2.0). See [`NOTICE`](./NOTICE).
 
 ## What it does
 
@@ -82,7 +79,7 @@ merge.
    (copy from [`workflows/orcarouter-code-review.yml`](./workflows/orcarouter-code-review.yml)):
 
    ```yaml
-   name: OrcaRouter Code Review
+   name: Orca-Code-Review
    on:
      pull_request_target:
        # ready_for_review makes the dashboard's trigger=ready_for_review mode
@@ -125,7 +122,7 @@ All optional — pass as `with:` inputs on the action:
 |---|---|---|
 | `orcarouter-api-key` | _(required)_ | OrcaRouter API key |
 | `orcarouter-url` | `https://api.orcarouter.ai/v1/chat/completions` | Gateway endpoint |
-| `brand` | `OrcaRouter Code Review` | Name shown on PR comments |
+| `brand` | `Orca-Code-Review` | Name shown on PR comments |
 | `router` | `orcarouter/code-review` | OrcaRouter router alias whose DSL recipe picks the cheap/strong model per tier (the action names no models) |
 | `fix-first` | `P0,P1` | Keep the PR on the cheap tier until these are cleared (then it's promoted) |
 | `block-on` | `P0,P1` | Fail the check (block merge) on one of these |

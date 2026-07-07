@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Exhaustive-mode merge for the OrcaRouter Code Review cascade.
+// Exhaustive-mode merge for the Orca-Code-Review cascade.
 //
 //   node exhaustive-merge.mjs --base <a.json> --new <b.json> --out <merged.json>
 //

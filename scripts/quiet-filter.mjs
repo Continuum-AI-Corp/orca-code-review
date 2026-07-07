@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Quiet-mode severity filter for the OrcaRouter Code Review cascade.
+// Quiet-mode severity filter for the Orca-Code-Review cascade.
 //
 //   node quiet-filter.mjs <result.json> --drop P2 --out <filtered.json>
 //

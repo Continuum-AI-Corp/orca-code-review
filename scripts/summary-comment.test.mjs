@@ -54,7 +54,7 @@ describe("marker and machine state", () => {
 
   test("header names the push number", () => {
     const out = run([], ["--tier", "strong", "--push", "4", "--gate", "pass"]);
-    assert.match(out, /## OrcaRouter Code Review — push 4/);
+    assert.match(out, /## Orca-Code-Review — push 4/);
   });
 });
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Availability check for the OrcaRouter Code Review cascade.
+// Availability check for the Orca-Code-Review cascade.
 //
 //   node check-result.mjs <result.json> <exit-code>
 //     exit 0 -> the engine produced a complete, usable review

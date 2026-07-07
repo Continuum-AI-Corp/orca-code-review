@@ -1,4 +1,4 @@
-# OrcaRouter Code Review — example consumer workflow.
+# Orca-Code-Review — example consumer workflow.
 #
 # Copy this file into your repo at `.github/workflows/` and add one secret,
 # `ORCAROUTER_API_KEY`. The review logic lives in the published action, so you
@@ -9,7 +9,7 @@
 # is clear does the strong model run the final pass. A severity gate can fail the
 # check to block the merge — mark it "required" in branch protection.
 
-name: OrcaRouter Code Review
+name: Orca-Code-Review
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
@@ -51,7 +51,7 @@ jobs:
           orcarouter-api-key: ${{ secrets.ORCAROUTER_API_KEY }}
           # All optional — uncomment to override the defaults:
           # orcarouter-url: ${{ secrets.ORCAROUTER_URL }}
-          # brand: "OrcaRouter Code Review"
+          # brand: "Orca-Code-Review"
           # router: "orcarouter/code-review"  # router whose DSL picks the model per tier
           # fix-first: "P0,P1"   # withhold the strong tier until these are fixed
           # block-on: "P0"       # fail the check (block merge) on these

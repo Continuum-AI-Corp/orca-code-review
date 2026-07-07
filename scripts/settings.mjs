@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Dashboard settings fetch for the OrcaRouter Code Review cascade.
+// Dashboard settings fetch for the Orca-Code-Review cascade.
 //
 //   node settings.mjs --url <orcarouter-url> --repo owner/name --out <path.json>
 //   (the API key comes from ORCAROUTER_API_KEY in the env, never a flag)

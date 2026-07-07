@@ -1,4 +1,4 @@
-# OrcaRouter Code Review — reusable composite action.
+# Orca-Code-Review — reusable composite action.
 #
 # Consumers reference this with `uses:` instead of copying the folder; see
 # workflows/orcarouter-code-review.yml for the ~15-line example workflow.
@@ -33,7 +33,7 @@
 # (scripts/report.mjs) posts severity counts — never code — to the OrcaRouter
 # control plane after the gate.
 
-name: "OrcaRouter Code Review"
+name: "Orca-Code-Review"
 description: "AI PR review via the OrcaRouter gateway — cost-tiered cascade with a severity merge gate."
 author: "OrcaRouter"
 
@@ -56,7 +56,7 @@ inputs:
   brand:
     description: "Name shown on PR comments."
     required: false
-    default: "OrcaRouter Code Review"
+    default: "Orca-Code-Review"
   router:
     description: >-
       OrcaRouter router alias (orcarouter/<name>) that owns model selection.
@@ -861,7 +861,7 @@ runs:
             try {
               await github.rest.issues.createLabel({
                 ...repo, name, color: '0e8a16',
-                description: 'OrcaRouter Code Review: promoted to the strong model tier',
+                description: 'Orca-Code-Review: promoted to the strong model tier',
               });
               core.info(`Created repository label ${name}.`);
             } catch (e2) {

@@ -1,4 +1,4 @@
-# OrcaRouter Code Review — model-selection policy (the real recipe).
+# Orca-Code-Review — model-selection policy (the real recipe).
 #
 # Paste this into the per-workspace router `orcarouter/code-review`
 # (Dashboard → Routers → code-review → DSL). The Action never names a model; it

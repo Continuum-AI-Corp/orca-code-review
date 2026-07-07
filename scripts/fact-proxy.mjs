@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// In-job fact-injecting proxy for the OrcaRouter Code Review cascade.
+// In-job fact-injecting proxy for the Orca-Code-Review cascade.
 //
 // OCR can only send the auth header (x-api-key / authorization) — it has no way
 // to attach custom headers. But the routing DSL routes on `headers[...]`. This

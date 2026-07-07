@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Severity gate for the OrcaRouter Code Review cascade.
+// Severity gate for the Orca-Code-Review cascade.
 //
 // Reads an `ocr review --format json` result file, extracts the [P0]/[P1]/[P2]
 // tag the model prefixes onto each comment, and answers one yes/no question:

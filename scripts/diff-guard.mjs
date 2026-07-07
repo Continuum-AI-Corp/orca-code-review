@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Oversized-diff guard for the OrcaRouter Code Review cascade.
+// Oversized-diff guard for the Orca-Code-Review cascade.
 //
 // Reviewing a huge diff is noise: the model truncates context, files get
 // skipped, and the severity signal collapses — better to skip loudly and let

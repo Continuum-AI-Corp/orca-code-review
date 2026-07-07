@@ -1,4 +1,4 @@
-// Shared severity parsing for the OrcaRouter Code Review scripts.
+// Shared severity parsing for the Orca-Code-Review scripts.
 //
 // One module owns the rule "which severity is this finding?" so the merge gate
 // (gate.mjs), the control-plane run report (report.mjs), and the PR summary
