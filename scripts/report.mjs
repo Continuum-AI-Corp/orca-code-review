@@ -71,6 +71,7 @@ async function main() {
     p0: counts.P0,
     p1: counts.P1,
     p2: counts.P2,
+    p3: counts.P3,
     gate_result: opts.gate,
   };
   if (opts.engineVersion) payload.engine_version = opts.engineVersion;

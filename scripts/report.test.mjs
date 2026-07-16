@@ -1,7 +1,7 @@
 // Contract tests for report.mjs — the best-effort run report to the
 // OrcaRouter control plane.
 //
-// Contract: POST {repo, pr_number, head_sha, tier, p0, p1, p2, gate_result,
+// Contract: POST {repo, pr_number, head_sha, tier, p0, p1, p2, p3, gate_result,
 // engine_version} to <origin of --url>/api/code_review/report with
 // `Authorization: Bearer <key>`. Counts come from the SAME parsing gate.mjs
 // uses (shared severity.mjs: leading tag + untagged->P1 fail-safe).
@@ -112,6 +112,7 @@ describe("payload assembly", () => {
         p0: 1,
         p1: 2, // [P1] + the untagged fail-safe
         p2: 2,
+        p3: 0,
         gate_result: "blocked",
         engine_version: "1.3.13",
       });

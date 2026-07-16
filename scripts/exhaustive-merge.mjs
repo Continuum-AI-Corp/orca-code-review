@@ -60,7 +60,7 @@ function readResult(file, label) {
 function keyOf(c) {
   const line = c?.end_line >= 1 ? c.end_line : c?.start_line >= 1 ? c.start_line : 0;
   const normalized = String(c?.content || "")
-    .replace(/^\s*\[P[012]\]\s*/i, "") // a re-run may re-tag the same issue
+    .replace(/^\s*\[P[0-3]\]\s*/i, "") // a re-run may re-tag the same issue
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
