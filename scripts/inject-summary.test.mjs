@@ -25,6 +25,17 @@ describe("injectSummary", () => {
     assert.ok(out.indexOf(REGION_END) < out.indexOf("My PR does a thing."), "author text sits below the region");
   });
 
+  test("preserves the author's leading whitespace verbatim on first insert", () => {
+    const body = "    indented code block\n\nprose after";
+    const out = injectSummary(body, SUMMARY);
+    assert.ok(out.startsWith(REGION_START), "region still first");
+    assert.ok(out.includes(`\n\n${body}`), "author body prepended verbatim, indentation intact");
+  });
+
+  test("a whitespace-only body collapses to region only (no author text to keep)", () => {
+    assert.equal(injectSummary("   \n\n  ", SUMMARY), `${REGION_START}\n${SUMMARY}\n${REGION_END}`);
+  });
+
   test("replaces an existing region in place without touching author text or position", () => {
     const body = `Intro line.\n\n${REGION_START}\nOLD SUMMARY\n${REGION_END}\n\nTrailing author notes.`;
     const out = injectSummary(body, SUMMARY);

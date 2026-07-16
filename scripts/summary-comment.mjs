@@ -16,7 +16,7 @@
 // stable — downstream tooling greps it):
 //   line 1  <!-- orca-code-review-summary -->   upsert marker; keep in sync
 //                                               with the action.yml step
-//   line 2  <!-- orca-cr-state: {"p0":…,"p1":…,"p2":…,"push":…} -->
+//   line 2  <!-- orca-cr-state: {"p0":…,"p1":…,"p2":…,"p3":…,"push":…} -->
 //           machine state: the NEXT run feeds this body back via --prev for
 //           the Δ column, and reads .push to number itself
 //   then    "## Orca-Code-Review — push N", the severity table (the
@@ -123,14 +123,14 @@ if (opts.prev) {
 }
 
 const delta = (d) => (d > 0 ? `+${d}` : String(d));
-const state = { p0: counts.P0, p1: counts.P1, p2: counts.P2, push };
+const state = { p0: counts.P0, p1: counts.P1, p2: counts.P2, p3: counts.P3, push };
 
 const lines = [MARKER, `<!-- orca-cr-state: ${JSON.stringify(state)} -->`, ""];
 lines.push(`## Orca-Code-Review — push ${push}`, "");
 if (prev) {
   lines.push("| Severity | Count | Δ vs previous push |", "|---|---|---|");
   for (const s of SEVERITIES) {
-    lines.push(`| ${s} | ${counts[s]} | ${delta(counts[s] - prev[s.toLowerCase()])} |`);
+    lines.push(`| ${s} | ${counts[s]} | ${delta(counts[s] - (prev[s.toLowerCase()] ?? 0))} |`);
   }
 } else {
   lines.push("| Severity | Count |", "|---|---|");

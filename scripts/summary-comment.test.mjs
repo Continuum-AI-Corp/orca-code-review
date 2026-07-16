@@ -49,7 +49,7 @@ describe("marker and machine state", () => {
     assert.equal(out.split("\n")[0], MARKER);
     const m = out.match(STATE_RE);
     assert.ok(m, "state line must be present");
-    assert.deepEqual(JSON.parse(m[1]), { p0: 1, p1: 1, p2: 0, push: 1 });
+    assert.deepEqual(JSON.parse(m[1]), { p0: 1, p1: 1, p2: 0, p3: 0, push: 1 });
   });
 
   test("header names the push number", () => {
@@ -69,14 +69,14 @@ describe("severity table", () => {
     assert.ok(!out.includes("Δ"), "no Δ column when there is no previous state");
   });
 
-  test("Δ vs previous push: negative, positive, and zero deltas", () => {
-    // push 1: p0:1 p1:2 p2:1 -> push 2: p0:0 p1:3 p2:1
+  test("Δ vs previous push: negative, positive, and zero deltas (incl. P3)", () => {
+    // push 1: p0:1 p1:2 p2:1 p3:2 -> push 2: p0:0 p1:3 p2:1 p3:1
     const push1 = run(
-      ["[P0] a", "[P1] b", "[P1] c", "[P2] d"],
+      ["[P0] a", "[P1] b", "[P1] c", "[P2] d", "[P3] e", "[P3] f"],
       ["--tier", "cheap", "--push", "1", "--gate", "blocked"],
     );
     const push2 = run(
-      ["[P1] x", "[P1] y", "[P1] z", "[P2] w"],
+      ["[P1] x", "[P1] y", "[P1] z", "[P2] w", "[P3] v"],
       ["--tier", "cheap", "--push", "2", "--gate", "blocked"],
       push1,
     );
@@ -84,7 +84,15 @@ describe("severity table", () => {
     assert.ok(push2.includes("| P0 | 0 | -1 |"), "negative delta");
     assert.ok(push2.includes("| P1 | 3 | +1 |"), "positive delta");
     assert.ok(push2.includes("| P2 | 1 | 0 |"), "zero delta");
-    assert.deepEqual(JSON.parse(push2.match(STATE_RE)[1]), { p0: 0, p1: 3, p2: 1, push: 2 });
+    assert.ok(push2.includes("| P3 | 1 | -1 |"), "P3 delta is numeric, never NaN");
+    assert.deepEqual(JSON.parse(push2.match(STATE_RE)[1]), { p0: 0, p1: 3, p2: 1, p3: 1, push: 2 });
+  });
+
+  test("a prior state written without p3 (older format) yields a numeric P3 delta, not NaN", () => {
+    const legacyPrev = '<!-- orca-cr-state: {"p0":0,"p1":0,"p2":0,"push":1} -->';
+    const out = run(["[P3] nit"], ["--tier", "strong", "--push", "2", "--gate", "pass"], legacyPrev);
+    assert.ok(out.includes("| P3 | 1 | +1 |"), "missing prev.p3 treated as 0");
+    assert.ok(!out.includes("NaN"), "no NaN anywhere in the table");
   });
 
   test("a previous body without a parseable state line just omits the Δ column", () => {
@@ -228,7 +236,7 @@ describe("mode notes (exhaustive / quiet)", () => {
   test("--passes > 1 renders the exhaustive note; state JSON is unchanged", () => {
     const out = run(["[P0] a"], ["--tier", "strong", "--push", "2", "--gate", "blocked", "--passes", "3"]);
     assert.ok(out.includes("exhaustive: 3 passes"));
-    assert.deepEqual(JSON.parse(out.match(STATE_RE)[1]), { p0: 1, p1: 0, p2: 0, push: 2 });
+    assert.deepEqual(JSON.parse(out.match(STATE_RE)[1]), { p0: 1, p1: 0, p2: 0, p3: 0, push: 2 });
   });
 
   test("--passes 1 (and no --passes at all) renders NO exhaustive note", () => {

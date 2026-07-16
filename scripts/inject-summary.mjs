@@ -46,6 +46,8 @@ export function injectSummary(body, summaryMd) {
   if (REGION_RE.test(current)) {
     return current.replace(REGION_RE, `${region}\n`);
   }
-  const rest = current.trimStart();
-  return rest ? `${region}\n\n${rest}` : region;
+  // Preserve the author's body verbatim (leading whitespace may be meaningful —
+  // an indented code block, nested list). trim() only decides whether there is
+  // any author text to keep below the region; it never rewrites what we prepend.
+  return current.trim() ? `${region}\n\n${current}` : region;
 }

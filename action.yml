@@ -902,7 +902,7 @@ runs:
           }
           const comments = result.comments || [];
           // OrcaRouter design: 🐳 header, colored severity dots, brand tagline.
-          const SEV = { P0: '🔴', P1: '🟠', P2: '🟡' };
+          const SEV = { P0: '🔴', P1: '🟠', P2: '🟡', P3: '⚪' };
           // Attribution for the Apache-2.0 engine lives in NOTICE + README, not
           // in every comment — OCR is consumed as a package, not redistributed.
           const footer =
@@ -916,9 +916,9 @@ runs:
             return;
           }
 
-          // Severity from the LEADING [P0]/[P1]/[P2] tag only (mirrors gate.mjs);
+          // Severity from the LEADING [P0]/[P1]/[P2]/[P3] tag only (mirrors gate.mjs);
           // a later mention must not override the missing-tag P1 fail-safe.
-          const tagRe = /^\s*\[(P[012])\]\s*/i;
+          const tagRe = /^\s*\[(P[0-3])\]\s*/i;
           const sevOf = (c) => {
             const m = String(c.content || '').match(tagRe);
             return m ? m[1].toUpperCase() : 'P1';
@@ -953,7 +953,7 @@ runs:
           };
           const counts = {};
           for (const c of comments) counts[sevOf(c)] = (counts[sevOf(c)] || 0) + 1;
-          const breakdown = ['P0', 'P1', 'P2']
+          const breakdown = ['P0', 'P1', 'P2', 'P3']
             .filter((s) => counts[s])
             .map((s) => `${SEV[s]} ${counts[s]} ${s}`)
             .join(' · ');
