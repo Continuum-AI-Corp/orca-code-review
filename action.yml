@@ -3,20 +3,21 @@
 # Consumers reference this with `uses:` instead of copying the folder; see
 # workflows/orcarouter-code-review.yml for the ~15-line example workflow.
 #
-# Stateful cost-tiered cascade: each PR stores its current tier as an
-# `orca-review:strong` label. A PR with no label runs the cheap tier first; if
-# that pass is clear of `fix-first` (P0/P1) it escalates to the strong tier in
-# the SAME run — so the strong tier always reviews before merge — and records a
-# permanent promotion so later pushes go straight to the strong tier. While the
-# cheap tier still finds `fix-first`, the strong tier is withheld (fix those
-# first — no point paying for it while obvious bugs remain). Findings post as
-# inline PR comments and a severity gate can fail the check to block the merge.
+# Single-tier review (gpt-5.5): one review pass per run. The cheap->strong
+# cascade was retired after testing showed the cheap tier added no value online
+# — it fails closed on large diffs and otherwise just escalates anyway, taxing
+# every PR with latency for no decision. Size-based front routing (small->cheap,
+# large->strong, decided up front) is a planned later optimization and is also
+# single-pass, so this design stays forward-compatible. Findings post as inline
+# PR comments and a severity gate can fail the check to block the merge.
 #
-# Model selection is NOT hardcoded here. The action only DECIDES the tier and
-# emits it as raw facts (x-cr-prev-tier / x-cr-prev-p0p1). OCR can't send custom
-# headers, so an in-job loopback proxy (scripts/fact-proxy.mjs) stamps those
-# facts onto OCR's requests; the workspace router's DSL recipe
-# (recipes/code-review.dsl.yaml) maps them to the concrete cheap/strong model.
+# Model selection is NOT hardcoded here. The action emits raw facts
+# (x-cr-prev-tier / x-cr-prev-p0p1); it injects the strong-tier facts so the
+# router picks the single model. OCR can't send custom headers, so an in-job
+# loopback proxy (scripts/fact-proxy.mjs) stamps those facts onto OCR's
+# requests; the workspace router's DSL recipe (recipes/code-review.dsl.yaml)
+# maps them to the concrete model. The facts and rule shape are preserved so a
+# future size-based front-routing policy can re-diverge without an Action change.
 #
 # Around the cascade: dashboard settings (scripts/settings.mjs, fetched
 # fail-open from the gateway; `settings: "false"` skips the fetch and makes
@@ -724,46 +725,25 @@ runs:
           done
         }
 
-        # Single-run cascade. A promoted PR (tier 1) injects prev-tier=strong, so
-        # the DSL's `promoted` rule keeps it on strong. A tier-0 PR injects the
-        # cheap-tier facts first; if that pass is clear of FIX_FIRST (P0/P1) we
-        # escalate IN THIS SAME RUN by injecting prev-tier=cheap/prev-p0p1=false
-        # (the DSL's `escalate` rule -> strong) — so the strong tier always reviews
-        # before the PR can merge — and record the promotion so later pushes skip
-        # the cheap pass. If the cheap tier still finds FIX_FIRST, hold the strong
-        # tier until those are fixed.
-        # Each tier's result is snapshotted and its outcome written to
-        # $GITHUB_OUTPUT AS SOON as it is known (outputs written before a later
-        # failure still surface), so the per-tier report steps have each tier's
-        # own counts: `cheap_gate` (blocked|pass) doubles as "the cheap tier ran
-        # to a decision", `strong_ran` marks a completed strong pass.
+        # Single review pass per run (gpt-5.5). The cheap->strong cascade was
+        # retired: testing showed the cheap tier added no value online — it fails
+        # closed on large diffs and otherwise just escalates anyway, taxing every
+        # PR with latency for no decision. We inject the strong-tier facts
+        # (prev-tier=strong) so the DSL's `promoted` rule routes gpt-5.5 for every
+        # run, and run exactly one enforced pass (exhaustive extras still allowed
+        # via the 4th arg). PROMOTE/HELD stay false and `cheap_gate` is never
+        # written, so the promotion-label step and the cheap report step no-op and
+        # the Enforce step does a plain single-pass gate. Size-based front routing
+        # (small->cheap, large->strong, decided up front) is a planned later
+        # optimization and is also single-pass, so this shape stays
+        # forward-compatible: the facts and the DSL rule shape are preserved.
         PROMOTE=false
         HELD=false
         PASSES=1
-        if [ "$TIER_STATE" = "1" ]; then
-          run_review "strong tier (promoted)" "strong" "false" true
-          cp "$RESULT" "$RESULT_STRONG"
-          echo "strong_ran=true" >> "$GITHUB_OUTPUT"
-        else
-          run_review "cheap tier" "cheap" "true" false
-          cp "$RESULT" "$RESULT_CHEAP"
-          if node "$GATE" "$RESULT" --has "$FIX_FIRST"; then
-            echo "Cheap tier found $FIX_FIRST — holding the strong tier until those are fixed."
-            echo "cheap_gate=blocked" >> "$GITHUB_OUTPUT"
-            HELD=true
-          else
-            echo "Cheap tier clear of $FIX_FIRST — escalating to the strong tier now."
-            echo "cheap_gate=pass" >> "$GITHUB_OUTPUT"
-            run_review "strong tier (escalation)" "cheap" "false" true
-            cp "$RESULT" "$RESULT_STRONG"
-            echo "strong_ran=true" >> "$GITHUB_OUTPUT"
-            PROMOTE=true
-          fi
-        fi
+        run_review "review (gpt-5.5)" "strong" "false" true
+        cp "$RESULT" "$RESULT_STRONG"
+        echo "strong_ran=true" >> "$GITHUB_OUTPUT"
         echo "promote=$PROMOTE" >> "$GITHUB_OUTPUT"
-        # `held` means the cheap tier withheld the strong review on fix-first
-        # findings; the gate must block so the PR can't merge with an unfixed
-        # P0/P1 that the strong tier never even saw.
         echo "held=$HELD" >> "$GITHUB_OUTPUT"
         # Engine passes behind the FINAL result (the last tier that ran) —
         # >1 only in exhaustive mode; the summary comment notes it.

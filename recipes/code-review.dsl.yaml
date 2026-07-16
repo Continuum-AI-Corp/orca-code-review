@@ -2,33 +2,44 @@
 #
 # Paste this into the per-workspace router `orcarouter/code-review`
 # (Dashboard → Routers → code-review → DSL). The Action never names a model; it
-# only injects raw facts as headers and this recipe decides cheap vs strong.
+# only injects raw facts as headers and this recipe decides which model runs.
+#
+# MIGRATION — this recipe lives in YOUR OrcaRouter workspace, not in the Action, so
+# bumping the Action version does NOT update it. An install still running an older
+# recipe (e.g. `promoted` -> z-ai/glm-5.1) keeps routing that model until you
+# re-paste the block below. After upgrading the Action, re-paste this into the
+# router DSL to actually pick up the single-tier gpt-5.5 policy.
 #
 # Facts injected by the Action (via the in-job proxy shim):
 #   x-cr-prev-tier : none | cheap | strong   (tier used on the previous pass)
 #   x-cr-prev-p0p1 : true | false            (did the previous pass find a P0/P1)
 #
-# Policy (first match wins):
-#   1. promoted    — once the PR reached strong, it stays strong forever
-#                    (strong-found P0/P1 blocks the merge but never demotes).
-#   2. holding     — cheap tier still has P0/P1 outstanding → keep looping cheap.
-#   3. escalate    — cheap tier came back clean → promote to the strong final pass.
-#   default        — fresh PR / no prior state → start on cheap.
+# Single-tier policy: testing showed the cheap->strong cascade added no value
+# online (cheap fails closed on large diffs, otherwise just escalates anyway), so
+# every branch now routes gpt-5.5 — the validated quality bar. The facts are
+# still injected and the rule shape is preserved so a future size-based
+# front-routing policy can re-diverge these branches without an Action change.
+#
+# The `model` in each `use:` below is FREELY CHOOSABLE — swap in any model your
+# OrcaRouter workspace can reach (e.g. openai/gpt-5.5, anthropic/claude-opus-4-8,
+# z-ai/glm-5.1, deepseek/deepseek-v4-pro). gpt-5.5 is our validated default; to
+# re-diverge into a real cost cascade, just give different branches different
+# models (e.g. a cheap model on `holding`, a strong one on `promoted`/`escalate`).
 
 version: 1
 
 rules:
   - id: promoted
     when: 'headers["x-cr-prev-tier"] == "strong"'
-    use: { model: "z-ai/glm-5.1" }
+    use: { model: "openai/gpt-5.5" }
 
   - id: holding
     when: 'headers["x-cr-prev-tier"] == "cheap" && headers["x-cr-prev-p0p1"] == "true"'
-    use: { model: "deepseek/deepseek-v4-pro" }
+    use: { model: "openai/gpt-5.5" }
 
   - id: escalate
     when: 'headers["x-cr-prev-tier"] == "cheap" && headers["x-cr-prev-p0p1"] == "false"'
-    use: { model: "z-ai/glm-5.1" }
+    use: { model: "openai/gpt-5.5" }
 
 default:
-  model: "deepseek/deepseek-v4-pro"
+  model: "openai/gpt-5.5"

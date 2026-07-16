@@ -1,0 +1,51 @@
+# Review THIS repo's own PRs with the action code in the PR branch.
+#
+# Uses the LOCAL action (`uses: ./`) instead of a published tag, so a PR is
+# reviewed by the version of action.yml/scripts it itself changes — the only way
+# to test action changes end-to-end before moving the release tag.
+#
+# Trigger is `pull_request` (NOT pull_request_target) on purpose: pull_request_target
+# would run the action from the base branch (main), which would test the OLD code,
+# not the PR's. The job is gated to SAME-REPO PRs (head repo == this repo): those
+# get secrets + a write token so the review can post + gate. Fork PRs are skipped
+# outright — they never see the secret (would fail the check), and running their
+# PR-controlled `uses: ./` code with the key would be a secret-exfil vector.
+#
+# ACCEPTED RISK: a same-repo PR still runs its own (PR-controlled) action code with
+# the real secret. That is inherent to `uses: ./` self-testing and is bounded to
+# people with push access to this repo (a trusted set) — the same trust GitHub
+# already grants them. There is no on-demand comment trigger: to re-review without
+# a new push, re-run this workflow from the Actions tab.
+#
+# COST: every run spends real, wallet-metered OrcaRouter quota. Requires the
+# `ORCAROUTER_API_KEY` secret on this repo.
+
+name: Self-review
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # Same-repo PRs only: fork PRs get no secret and must not run PR-controlled
+    # action code with the key.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      # Required so the local `uses: ./` action definition is present in the
+      # workspace. On pull_request, the default checkout is the PR merge ref, so
+      # `./` resolves to the action code being changed by the PR.
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          orcarouter-api-key: ${{ secrets.ORCAROUTER_API_KEY }}
