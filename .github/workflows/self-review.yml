@@ -46,9 +46,17 @@ jobs:
         contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     steps:
       # Required so the local `uses: ./` action definition is present in the
-      # workspace. For pull_request this checks out the PR merge ref, so `./`
-      # resolves to the action code being changed by the PR.
+      # workspace. For pull_request, github.ref is already the PR merge ref, so `./`
+      # resolves to the action code being changed by the PR. For issue_comment
+      # (/orcarouter-review) the event carries no PR ref, so a default checkout would
+      # land on the base branch and `uses: ./` would run the OLD (main) action — the
+      # opposite of self-review. Pin the comment path to the PR merge ref explicitly.
       - uses: actions/checkout@v4
+        with:
+          ref: >-
+            ${{ github.event_name == 'issue_comment'
+                && format('refs/pull/{0}/merge', github.event.issue.number)
+                || github.ref }}
       - uses: ./
         with:
           orcarouter-api-key: ${{ secrets.ORCAROUTER_API_KEY }}
