@@ -6,25 +6,29 @@
 #
 # Trigger is `pull_request` (NOT pull_request_target) on purpose: pull_request_target
 # would run the action from the base branch (main), which would test the OLD code,
-# not the PR's. Same-repo PRs (branches pushed straight to this repo) still receive
-# secrets and a write token under `pull_request`, so the review can post + gate.
+# not the PR's. The job is gated to SAME-REPO PRs (head repo == this repo): those
+# get secrets + a write token so the review can post + gate. Fork PRs are skipped
+# outright — they never see the secret (would fail the check), and running their
+# PR-controlled `uses: ./` code with the key would be a secret-exfil vector.
+#
+# ACCEPTED RISK: a same-repo PR still runs its own (PR-controlled) action code with
+# the real secret. That is inherent to `uses: ./` self-testing and is bounded to
+# people with push access to this repo (a trusted set) — the same trust GitHub
+# already grants them. There is no on-demand comment trigger: to re-review without
+# a new push, re-run this workflow from the Actions tab.
 #
 # COST: every run spends real, wallet-metered OrcaRouter quota. Requires the
-# `ORCAROUTER_API_KEY` secret on this repo. Fork PRs never see that secret, so the
-# job condition below skips them outright (head repo != this repo) — otherwise they
-# would reach the action with an empty key and fail the required check, not "skip".
+# `ORCAROUTER_API_KEY` secret on this repo.
 
 name: Self-review
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review]
-  issue_comment:
-    types: [created]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -34,29 +38,14 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
-    # Auto-run on PR events, or on demand when a maintainer comments
-    # `/orcarouter-review` (lets you re-review without a new push, and gates the
-    # paid run to owner/member/collaborator).
-    if: |
-      (github.event_name == 'pull_request' &&
-        github.event.pull_request.head.repo.full_name == github.repository) ||
-      (github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        startsWith(github.event.comment.body, '/orcarouter-review') &&
-        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+    # Same-repo PRs only: fork PRs get no secret and must not run PR-controlled
+    # action code with the key.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       # Required so the local `uses: ./` action definition is present in the
-      # workspace. For pull_request, github.ref is already the PR merge ref, so `./`
-      # resolves to the action code being changed by the PR. For issue_comment
-      # (/orcarouter-review) the event carries no PR ref, so a default checkout would
-      # land on the base branch and `uses: ./` would run the OLD (main) action — the
-      # opposite of self-review. Pin the comment path to the PR merge ref explicitly.
+      # workspace. On pull_request, the default checkout is the PR merge ref, so
+      # `./` resolves to the action code being changed by the PR.
       - uses: actions/checkout@v4
-        with:
-          ref: >-
-            ${{ github.event_name == 'issue_comment'
-                && format('refs/pull/{0}/merge', github.event.issue.number)
-                || github.ref }}
       - uses: ./
         with:
           orcarouter-api-key: ${{ secrets.ORCAROUTER_API_KEY }}
