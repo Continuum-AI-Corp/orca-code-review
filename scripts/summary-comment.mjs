@@ -5,10 +5,12 @@
 //     --gate pass|blocked [--prev <file with the previous comment body>]
 //     [--passes <n>] [--quiet] [--block-on P0,P1] [--held] [--fix-first P0,P1]
 //
-// Prints the comment MARKDOWN to stdout. The driver (action.yml) UPSERTS it:
-// it finds the existing PR comment via the marker line, updates it in place,
-// else creates it — ONE summary comment per PR, edited on every push, so the
-// timeline is never spammed.
+// Prints the summary MARKDOWN to stdout. The driver (action.yml) writes it into
+// a marker-delimited region of the PR DESCRIPTION body (scripts/inject-summary.mjs),
+// replacing that region in place on every push — ONE summary per PR, pinned at
+// the top of the description, so the comment timeline is never spammed. The
+// marker line below still leads the markdown (inject-summary wraps it) so the
+// next push can read the machine-state line back for the push counter + Δ column.
 //
 // Structure (locked by summary-comment.test.mjs; the wording is deliberately
 // stable — downstream tooling greps it):

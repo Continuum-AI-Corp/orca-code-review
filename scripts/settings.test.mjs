@@ -379,7 +379,7 @@ describe("action.yml wiring (settings, quiet mode)", () => {
 
   test("only the POST step reads the quiet-filtered result; gate + BOTH report steps keep the true counts", () => {
     const yml = actionYml();
-    const post = yml.slice(yml.indexOf("- name: Post review comments"), yml.indexOf("- name: Summary comment"));
+    const post = yml.slice(yml.indexOf("- name: Post review comments"), yml.indexOf("- name: Summary (PR description)"));
     assert.match(post, /result-posted\.json/, "posting must read the quiet-filtered file");
     const gate = yml.slice(yml.indexOf("- name: Enforce severity gate"), yml.indexOf("- name: Report run (cheap tier)"));
     assert.match(gate, /\/result\.json/, "the gate must read the unfiltered result");
@@ -410,7 +410,7 @@ describe("action.yml wiring (settings, quiet mode)", () => {
 
   test("the summary step passes --held + --fix-first in the held branch so the ❌ count follows fix-first", () => {
     const yml = actionYml();
-    const summary = yml.slice(yml.indexOf("- name: Summary comment"), yml.indexOf("- name: Enforce severity gate"));
+    const summary = yml.slice(yml.indexOf("- name: Summary (PR description)"), yml.indexOf("- name: Enforce severity gate"));
     assert.match(summary, /FIX_FIRST: \$\{\{ steps\.settings\.outputs\.fix_first \}\}/, "the fix-first set must reach the summary step");
     assert.match(summary, /HELD === 'true'/, "the held branch must be keyed off the cascade's held output");
     assert.match(summary, /'--held', '--fix-first'/, "held runs must pass --held --fix-first to summary-comment.mjs");
@@ -418,7 +418,7 @@ describe("action.yml wiring (settings, quiet mode)", () => {
 
   test("the summary step passes the EFFECTIVE block-on set to summary-comment.mjs", () => {
     const yml = actionYml();
-    const summary = yml.slice(yml.indexOf("- name: Summary comment"), yml.indexOf("- name: Enforce severity gate"));
+    const summary = yml.slice(yml.indexOf("- name: Summary (PR description)"), yml.indexOf("- name: Enforce severity gate"));
     assert.match(summary, /--block-on/, "the ❌ count must follow the configured block-on set, not a hardcoded P0+P1");
     assert.match(summary, /steps\.settings\.outputs\.block_on/, "and it must be the settings-aware effective value");
   });
@@ -449,7 +449,7 @@ describe("action.yml wiring (settings, quiet mode)", () => {
 
   test("a resumed review retires the stale settings-skip and oversized-skip notices", () => {
     const yml = actionYml();
-    const summary = yml.slice(yml.indexOf("- name: Summary comment"), yml.indexOf("- name: Enforce severity gate"));
+    const summary = yml.slice(yml.indexOf("- name: Summary (PR description)"), yml.indexOf("- name: Enforce severity gate"));
     assert.match(summary, /orca-code-review-disabled/, "the 'auto review off' notice must be cleaned up");
     assert.match(summary, /orca-code-review-skip/, "the 'diff too large' notice must be cleaned up");
     assert.match(summary, /deleteComment/, "cleanup means deleting the stale comment");
