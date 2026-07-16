@@ -1,0 +1,52 @@
+# Review THIS repo's own PRs with the action code in the PR branch.
+#
+# Uses the LOCAL action (`uses: ./`) instead of a published tag, so a PR is
+# reviewed by the version of action.yml/scripts it itself changes — the only way
+# to test action changes end-to-end before moving the release tag.
+#
+# Trigger is `pull_request` (NOT pull_request_target) on purpose: pull_request_target
+# would run the action from the base branch (main), which would test the OLD code,
+# not the PR's. Same-repo PRs (branches pushed straight to this repo) still receive
+# secrets and a write token under `pull_request`, so the review can post + gate.
+#
+# COST: every run spends real, wallet-metered OrcaRouter quota. Requires the
+# `ORCAROUTER_API_KEY` secret on this repo. Fork PRs get no secret (key is empty)
+# and are effectively skipped.
+
+name: Self-review
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # Auto-run on PR events, or on demand when a maintainer comments
+    # `/orcarouter-review` (lets you re-review without a new push, and gates the
+    # paid run to owner/member/collaborator).
+    if: |
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/orcarouter-review') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+    steps:
+      # Required so the local `uses: ./` action definition is present in the
+      # workspace. For pull_request this checks out the PR merge ref, so `./`
+      # resolves to the action code being changed by the PR.
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          orcarouter-api-key: ${{ secrets.ORCAROUTER_API_KEY }}
