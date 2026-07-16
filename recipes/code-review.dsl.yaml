@@ -4,6 +4,12 @@
 # (Dashboard → Routers → code-review → DSL). The Action never names a model; it
 # only injects raw facts as headers and this recipe decides which model runs.
 #
+# MIGRATION — this recipe lives in YOUR OrcaRouter workspace, not in the Action, so
+# bumping the Action version does NOT update it. An install still running an older
+# recipe (e.g. `promoted` -> z-ai/glm-5.1) keeps routing that model until you
+# re-paste the block below. After upgrading the Action, re-paste this into the
+# router DSL to actually pick up the single-tier gpt-5.5 policy.
+#
 # Facts injected by the Action (via the in-job proxy shim):
 #   x-cr-prev-tier : none | cheap | strong   (tier used on the previous pass)
 #   x-cr-prev-p0p1 : true | false            (did the previous pass find a P0/P1)

@@ -10,8 +10,9 @@
 # secrets and a write token under `pull_request`, so the review can post + gate.
 #
 # COST: every run spends real, wallet-metered OrcaRouter quota. Requires the
-# `ORCAROUTER_API_KEY` secret on this repo. Fork PRs get no secret (key is empty)
-# and are effectively skipped.
+# `ORCAROUTER_API_KEY` secret on this repo. Fork PRs never see that secret, so the
+# job condition below skips them outright (head repo != this repo) — otherwise they
+# would reach the action with an empty key and fail the required check, not "skip".
 
 name: Self-review
 
@@ -37,7 +38,8 @@ jobs:
     # `/orcarouter-review` (lets you re-review without a new push, and gates the
     # paid run to owner/member/collaborator).
     if: |
-      github.event_name == 'pull_request' ||
+      (github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
         startsWith(github.event.comment.body, '/orcarouter-review') &&
