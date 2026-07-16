@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Severity gate for the Orca-Code-Review cascade.
 //
-// Reads an `ocr review --format json` result file, extracts the [P0]/[P1]/[P2]
+// Reads an `ocr review --format json` result file, extracts the [P0]/[P1]/[P2]/[P3]
 // tag the model prefixes onto each comment, and answers one yes/no question:
 // "does any finding carry a severity in the given set?"
 //

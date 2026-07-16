@@ -2,7 +2,7 @@
 // this finding?". gate.mjs (merge gate / promotion), report.mjs (control-plane
 // counts) and summary-comment.mjs (PR summary) all consume it, so these tests
 // pin the two rules they must share:
-//   1. only a LEADING [P0]/[P1]/[P2] tag counts (case-insensitive);
+//   1. only a LEADING [P0]/[P1]/[P2]/[P3] tag counts (case-insensitive);
 //   2. an untagged finding defaults to P1 (fail-safe — escalate, don't pass).
 
 import { describe, test } from "node:test";
@@ -13,7 +13,8 @@ import { SEVERITIES, severityOf, countSeverities } from "./severity.mjs";
 describe("severityOf", () => {
   test("reads the leading tag", () => {
     assert.equal(severityOf({ content: "[P0] sql injection" }), "P0");
-    assert.equal(severityOf({ content: "[P2] use const" }), "P2");
+    assert.equal(severityOf({ content: "[P2] conditional bug" }), "P2");
+    assert.equal(severityOf({ content: "[P3] use const" }), "P3");
   });
 
   test("is case-insensitive and tolerates leading whitespace", () => {
@@ -37,9 +38,9 @@ describe("severityOf", () => {
 });
 
 describe("countSeverities", () => {
-  test("always returns all three keys, zeroed", () => {
-    assert.deepEqual(countSeverities([]), { P0: 0, P1: 0, P2: 0 });
-    assert.deepEqual(countSeverities(undefined), { P0: 0, P1: 0, P2: 0 });
+  test("always returns all four keys, zeroed", () => {
+    assert.deepEqual(countSeverities([]), { P0: 0, P1: 0, P2: 0, P3: 0 });
+    assert.deepEqual(countSeverities(undefined), { P0: 0, P1: 0, P2: 0, P3: 0 });
   });
 
   test("counts by leading tag with the P1 fail-safe", () => {
@@ -49,11 +50,12 @@ describe("countSeverities", () => {
       { content: "untagged" },
       { content: "[P2] c" },
       { content: "[P2] d" },
+      { content: "[P3] e" },
     ]);
-    assert.deepEqual(counts, { P0: 1, P1: 2, P2: 2 });
+    assert.deepEqual(counts, { P0: 1, P1: 2, P2: 2, P3: 1 });
   });
 
-  test("SEVERITIES lists P0/P1/P2 in display order", () => {
-    assert.deepEqual(SEVERITIES, ["P0", "P1", "P2"]);
+  test("SEVERITIES lists P0/P1/P2/P3 in display order", () => {
+    assert.deepEqual(SEVERITIES, ["P0", "P1", "P2", "P3"]);
   });
 });

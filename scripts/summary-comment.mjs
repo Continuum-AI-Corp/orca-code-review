@@ -5,16 +5,18 @@
 //     --gate pass|blocked [--prev <file with the previous comment body>]
 //     [--passes <n>] [--quiet] [--block-on P0,P1] [--held] [--fix-first P0,P1]
 //
-// Prints the comment MARKDOWN to stdout. The driver (action.yml) UPSERTS it:
-// it finds the existing PR comment via the marker line, updates it in place,
-// else creates it — ONE summary comment per PR, edited on every push, so the
-// timeline is never spammed.
+// Prints the summary MARKDOWN to stdout. The driver (action.yml) writes it into
+// a marker-delimited region of the PR DESCRIPTION body (scripts/inject-summary.mjs),
+// replacing that region in place on every push — ONE summary per PR, pinned at
+// the top of the description, so the comment timeline is never spammed. The
+// marker line below still leads the markdown (inject-summary wraps it) so the
+// next push can read the machine-state line back for the push counter + Δ column.
 //
 // Structure (locked by summary-comment.test.mjs; the wording is deliberately
 // stable — downstream tooling greps it):
 //   line 1  <!-- orca-code-review-summary -->   upsert marker; keep in sync
 //                                               with the action.yml step
-//   line 2  <!-- orca-cr-state: {"p0":…,"p1":…,"p2":…,"push":…} -->
+//   line 2  <!-- orca-cr-state: {"p0":…,"p1":…,"p2":…,"p3":…,"push":…} -->
 //           machine state: the NEXT run feeds this body back via --prev for
 //           the Δ column, and reads .push to number itself
 //   then    "## Orca-Code-Review — push N", the severity table (the
@@ -121,14 +123,14 @@ if (opts.prev) {
 }
 
 const delta = (d) => (d > 0 ? `+${d}` : String(d));
-const state = { p0: counts.P0, p1: counts.P1, p2: counts.P2, push };
+const state = { p0: counts.P0, p1: counts.P1, p2: counts.P2, p3: counts.P3, push };
 
 const lines = [MARKER, `<!-- orca-cr-state: ${JSON.stringify(state)} -->`, ""];
 lines.push(`## Orca-Code-Review — push ${push}`, "");
 if (prev) {
   lines.push("| Severity | Count | Δ vs previous push |", "|---|---|---|");
   for (const s of SEVERITIES) {
-    lines.push(`| ${s} | ${counts[s]} | ${delta(counts[s] - prev[s.toLowerCase()])} |`);
+    lines.push(`| ${s} | ${counts[s]} | ${delta(counts[s] - (prev[s.toLowerCase()] ?? 0))} |`);
   }
 } else {
   lines.push("| Severity | Count |", "|---|---|");

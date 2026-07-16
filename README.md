@@ -27,9 +27,10 @@ merge.
    language/security review via `--background` (it adds to, never replaces,
    those checks) using `rules/severity-instruction.md`.
 3. **Inline comments + one summary** — findings post on the exact lines of the
-   PR, and a single summary comment — severity counts with a Δ against the
-   previous push, the current tier, and the gate verdict — is edited in place
-   on every push instead of adding a new comment each time.
+   PR, and a single summary — severity counts with a Δ against the previous
+   push, the current tier, and the gate verdict — is written into the top of
+   the PR description and refreshed in place on every push (so it stays pinned
+   above the inline findings instead of sinking down the comment timeline).
 4. **Merge gate** — the job fails if any **P0/P1** is found; mark the check
    "required" in branch protection to block the merge.
 5. **Per-commit loop** — `synchronize` re-reviews on every new push; comment
@@ -151,7 +152,7 @@ OrcaRouter dashboard without touching the workflow:
 | `auto_review` | `true` / `false` | `false`: automatic (`pull_request_target`) runs skip the engine, leave one small "automatic review is off" comment, and **pass** the check. `/orcarouter-review` comment commands still run. |
 | `trigger` | `every_push` / `ready_for_review` / `on_demand` | `every_push`: review every push. `ready_for_review`: skip automatic runs **while the PR is a draft** (add `ready_for_review` to your workflow's `pull_request_target.types` so the review fires when the PR leaves draft). `on_demand`: skip all automatic runs — only `/orcarouter-review` comments review. All skips pass the check. |
 | `exhaustive` | `false` / `true` | Re-run the engine up to **2 extra times on the strong (enforced) tier**, deduplicating findings across passes (one review pass is not exhaustive; a re-run surfaces missed findings). The cheap screening pass never gets extras — its result is either superseded by the same-run strong review or held on fix-first findings anyway. The loop stops early once a pass adds nothing new **or a fix-first (P0/P1) finding is already in hand** (the gate blocks on it regardless of extra depth). **Cost cap: at most 3 engine passes total on the enforced tier.** The summary comment notes `exhaustive: N passes`. |
-| `quiet` | `false` / `true` | Advisory **P2 comments are not posted inline** — they are muted at the posting step only. The summary comment keeps the **true** P0/P1/P2 counts with a `quiet mode: P2 shown in summary only` note, and the gate/run report always see the unfiltered counts. |
+| `quiet` | `false` / `true` | Advisory **P2 comments are not posted inline** — they are muted at the posting step only. The summary keeps the **true** P0/P1/P2 counts with a `quiet mode: P2 shown in summary only` note, and the gate/run report always see the unfiltered counts. |
 | `fix_first` | `"P0,P1"` | Same meaning as the `fix-first` input — see precedence below. |
 | `block_on` | `"P0,P1"` | Same meaning as the `block-on` input — see precedence below. |
 | `rubric` | `""` | Non-empty: **replaces** the built-in `rules/severity-instruction.md` as the review instruction. A custom rubric MUST retain the mandate that every comment starts with a literal `[P0]`/`[P1]`/`[P2]` tag — the tiering, gate, and counts all parse it. (Untagged output is protected regardless: a missing tag falls back to P1, so it still escalates and blocks rather than slipping through.) |

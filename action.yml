@@ -29,8 +29,9 @@
 # oversized-diff guard (scripts/diff-guard.mjs) decides review/skip BEFORE the
 # engine ever runs (a skip posts a notice and, by default, FAILS the check so
 # the merge gate can't be padded around — `on-oversized-diff: "pass"` makes it
-# advisory); one summary comment per PR (scripts/summary-comment.mjs) is
-# upserted in place on every push; and a best-effort per-tier run report
+# advisory); one summary per PR (scripts/summary-comment.mjs) is written into
+# a marker region of the PR description (scripts/inject-summary.mjs) so it stays
+# pinned at the top, replaced in place on every push; and a best-effort per-tier run report
 # (scripts/report.mjs) posts severity counts — never code — to the OrcaRouter
 # control plane after the gate.
 
@@ -901,7 +902,7 @@ runs:
           }
           const comments = result.comments || [];
           // OrcaRouter design: 🐳 header, colored severity dots, brand tagline.
-          const SEV = { P0: '🔴', P1: '🟠', P2: '🟡' };
+          const SEV = { P0: '🔴', P1: '🟠', P2: '🟡', P3: '⚪' };
           // Attribution for the Apache-2.0 engine lives in NOTICE + README, not
           // in every comment — OCR is consumed as a package, not redistributed.
           const footer =
@@ -915,9 +916,9 @@ runs:
             return;
           }
 
-          // Severity from the LEADING [P0]/[P1]/[P2] tag only (mirrors gate.mjs);
+          // Severity from the LEADING [P0]/[P1]/[P2]/[P3] tag only (mirrors gate.mjs);
           // a later mention must not override the missing-tag P1 fail-safe.
-          const tagRe = /^\s*\[(P[012])\]\s*/i;
+          const tagRe = /^\s*\[(P[0-3])\]\s*/i;
           const sevOf = (c) => {
             const m = String(c.content || '').match(tagRe);
             return m ? m[1].toUpperCase() : 'P1';
@@ -952,7 +953,7 @@ runs:
           };
           const counts = {};
           for (const c of comments) counts[sevOf(c)] = (counts[sevOf(c)] || 0) + 1;
-          const breakdown = ['P0', 'P1', 'P2']
+          const breakdown = ['P0', 'P1', 'P2', 'P3']
             .filter((s) => counts[s])
             .map((s) => `${SEV[s]} ${counts[s]} ${s}`)
             .join(' · ');
@@ -993,11 +994,13 @@ runs:
             await github.rest.issues.createComment({ ...repo, issue_number: num, body: fallback + footer });
           }
 
-    # ONE summary comment per PR, upserted by marker and edited in place on
-    # every push: severity counts with Δ vs the previous push (state travels
-    # in an HTML comment inside the body), the tier, and the gate verdict.
+    # ONE summary per PR, written into the PR DESCRIPTION body (the only element
+    # GitHub anchors at the very top) inside a marker-delimited region that is
+    # replaced in place on every push: severity counts with Δ vs the previous
+    # push (state travels in an HTML comment inside the region), the tier, and
+    # the gate verdict. The author's own description text is preserved untouched.
     # Runs BEFORE the enforce step so a blocked run still updates the summary.
-    - name: Summary comment (upsert)
+    - name: Summary (PR description)
       if: steps.settings.outputs.decision != 'skip' && steps.guard.outputs.decision != 'skip'
       uses: actions/github-script@v7
       env:
@@ -1007,6 +1010,7 @@ runs:
         RESULT: ${{ runner.temp }}/result.json
         PREV_BODY: ${{ runner.temp }}/prev-summary.md
         SUMMARY_SCRIPT: ${{ github.action_path }}/scripts/summary-comment.mjs
+        INJECT_SCRIPT: ${{ github.action_path }}/scripts/inject-summary.mjs
         GATE: ${{ github.action_path }}/scripts/gate.mjs
         BLOCK_ON: ${{ steps.settings.outputs.block_on }}
         # Fix-first set — the ❌ count is taken over THIS (not block-on) on a held run.
@@ -1020,38 +1024,44 @@ runs:
         script: |
           const fs = require('fs');
           const { execFileSync } = require('child_process');
+          const { pathToFileURL } = require('url');
+          const { injectSummary, extractRegion } = await import(pathToFileURL(process.env.INJECT_SCRIPT).href);
           const num = Number(process.env.PR_NUMBER);
           const repo = { owner: context.repo.owner, repo: context.repo.repo };
-          // Keep in sync with scripts/summary-comment.mjs.
+          // Legacy marker: earlier versions posted the summary as an issue
+          // comment. Keep in sync with scripts/summary-comment.mjs.
           const MARKER = '<!-- orca-code-review-summary -->';
-
-          const comments = await github.paginate(github.rest.issues.listComments, {
-            ...repo, issue_number: num, per_page: 100,
-          });
-          const existing = comments.find((c) => c.body && c.body.includes(MARKER));
 
           // A real review ran, so retire stale notices (best-effort): the
           // "automatic review is off", "diff too large", and guardrail/firewall
           // "review blocked" comments would otherwise outlive the condition they
-          // describe once a clean review posts.
-          for (const stale of ['<!-- orca-code-review-disabled -->', '<!-- orca-code-review-skip -->', '<!-- orca-code-review-block -->']) {
+          // describe once a clean review posts. Also delete a legacy summary
+          // issue comment from a pre-description-body install so it doesn't
+          // linger as a duplicate of the description summary.
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            ...repo, issue_number: num, per_page: 100,
+          });
+          for (const stale of ['<!-- orca-code-review-disabled -->', '<!-- orca-code-review-skip -->', '<!-- orca-code-review-block -->', MARKER]) {
             const notice = comments.find((c) => c.body && c.body.includes(stale));
             if (!notice) continue;
             try {
               await github.rest.issues.deleteComment({ ...repo, comment_id: notice.id });
             } catch (e) {
-              console.log(`Could not delete a stale skip notice (${stale}):`, e.message);
+              console.log(`Could not delete a stale notice (${stale}):`, e.message);
             }
           }
 
-          // Feed the previous body back for the Δ column and number this push
-          // from its machine state (first summary = push 1).
+          // Read the current PR description; the previous summary (if any) lives
+          // in its marker region. Feed that back for the Δ column and number
+          // this push from its machine state (first summary = push 1).
+          const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: num });
+          const prevRegion = extractRegion(pr.body);
           const args = [process.env.SUMMARY_SCRIPT, process.env.RESULT];
           let push = 1;
-          if (existing) {
-            fs.writeFileSync(process.env.PREV_BODY, existing.body);
+          if (prevRegion) {
+            fs.writeFileSync(process.env.PREV_BODY, prevRegion);
             args.push('--prev', process.env.PREV_BODY);
-            const m = existing.body.match(/<!-- orca-cr-state: (\{.*?\}) -->/);
+            const m = prevRegion.match(/<!-- orca-cr-state: (\{.*?\}) -->/);
             if (m) {
               try { push = (Number(JSON.parse(m[1]).push) || 0) + 1; } catch { /* keep 1 */ }
             }
@@ -1085,11 +1095,11 @@ runs:
           args.push('--passes', process.env.PASSES || '1');
           if (process.env.QUIET === 'true') args.push('--quiet');
 
-          const body = execFileSync('node', args, { encoding: 'utf8' });
-          if (existing) {
-            await github.rest.issues.updateComment({ ...repo, comment_id: existing.id, body });
-          } else {
-            await github.rest.issues.createComment({ ...repo, issue_number: num, body });
+          const summaryMd = execFileSync('node', args, { encoding: 'utf8' });
+          // Preserve the author's description text; only the marker region changes.
+          const newBody = injectSummary(pr.body, summaryMd);
+          if (newBody !== (pr.body || '')) {
+            await github.rest.pulls.update({ ...repo, pull_number: num, body: newBody });
           }
 
     - name: Enforce severity gate
