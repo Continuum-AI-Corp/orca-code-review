@@ -4,7 +4,7 @@
 // The structure is load-bearing: the driver (action.yml) upserts the comment
 // by the MARKER line, and the NEXT run parses the orca-cr-state line out of
 // the previous body for the push counter and the Δ column. These tests pin:
-// marker first, state JSON round-trips, table rows for P0/P1/P2 always
+// marker first, state JSON round-trips, table rows for P0/P1/P2/P3 always
 // present (even at 0), delta math including negative deltas, the three
 // tier-state lines, and the gate line.
 
@@ -59,12 +59,13 @@ describe("marker and machine state", () => {
 });
 
 describe("severity table", () => {
-  test("P0/P1/P2 rows are always present, even at 0 — and no Δ column without --prev", () => {
+  test("P0/P1/P2/P3 rows are always present, even at 0 — and no Δ column without --prev", () => {
     const out = run([], ["--tier", "strong", "--push", "1", "--gate", "pass"]);
     assert.ok(out.includes("| Severity | Count |"));
     assert.ok(out.includes("| P0 | 0 |"));
     assert.ok(out.includes("| P1 | 0 |"));
     assert.ok(out.includes("| P2 | 0 |"));
+    assert.ok(out.includes("| P3 | 0 |"));
     assert.ok(!out.includes("Δ"), "no Δ column when there is no previous state");
   });
 
