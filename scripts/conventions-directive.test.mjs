@@ -44,6 +44,43 @@ describe("project-conventions directive: base-revision extraction", () => {
     assert.match(yml, />> "\$BACKGROUND"/, "the doc must be appended to the background file");
   });
 
+  test("conventions are only loaded when the PR targets the default branch", () => {
+    const yml = read("action.yml");
+    // A PR base is author-chosen; a push-access contributor could target a
+    // branch holding a malicious AGENTS.md. The base is only a protected,
+    // un-rewritable ref when it is the repo's default branch, so the doc is
+    // gated on that. The pr step exports the boolean, the review step gates.
+    assert.match(
+      yml,
+      /base_is_default', String\(base === context\.payload\.repository\.default_branch\)/,
+      "the pr step must derive base_is_default from the repo default branch",
+    );
+    assert.match(yml, /BASE_IS_DEFAULT: \$\{\{ steps\.pr\.outputs\.base_is_default \}\}/, "must wire base_is_default into the env");
+    assert.match(yml, /if \[ "\$BASE_IS_DEFAULT" = "true" \]/, "the conventions loop must gate on BASE_IS_DEFAULT");
+  });
+
+  test("the appended conventions doc is size-capped", () => {
+    const yml = read("action.yml");
+    // Guards the inline --background argv against an oversized base doc (E2BIG).
+    assert.match(yml, /CONVENTIONS_MAX_BYTES=\d+/, "must define a byte cap");
+    assert.match(yml, /head -c "\$CONVENTIONS_MAX_BYTES"/, "must truncate the doc to the byte cap");
+  });
+
+  test("the framing directive is appended before the base-revision doc", () => {
+    const yml = read("action.yml");
+    // Order matters: the untrusted-data framing must lead so the engine reads
+    // the doc as reference data, not instructions. Assert the directive cat
+    // precedes the BEGIN-doc marker within the append block.
+    const directiveIdx = yml.indexOf('cat "$CONVENTIONS_DIRECTIVE"');
+    const docBeginIdx = yml.indexOf("----- BEGIN %s");
+    assert.ok(directiveIdx !== -1, "the directive must be catted into the background");
+    assert.ok(docBeginIdx !== -1, "the doc must be delimited by a BEGIN marker");
+    assert.ok(
+      directiveIdx < docBeginIdx,
+      "the framing directive must be appended before the base-revision doc",
+    );
+  });
+
   test("the directive frames the doc as untrusted and severity-preserving", () => {
     const md = read("rules/conventions-directive.md");
     assert.match(md, /untrusted/i, "must mark the conventions doc as untrusted data");
