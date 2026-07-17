@@ -176,6 +176,14 @@ runs:
           core.setOutput('base', base);
           core.setOutput('head_sha', headSha);
           core.setOutput('number', String(num));
+          // The project-conventions doc is only trusted when the PR targets the
+          // repository's DEFAULT branch. A PR base is author-chosen: a push-access
+          // contributor could create a branch holding a malicious AGENTS.md and
+          // target it, so "base" is not inherently protected — but the default
+          // branch is the canonical ref they cannot rewrite without an approved
+          // merge. (Full branch-protection checks need admin token scope and can
+          // 403, so default-branch is the robust proxy.)
+          core.setOutput('base_is_default', String(base === context.payload.repository.default_branch));
           // Draft state feeds the settings gate: trigger=ready_for_review
           // skips auto-reviews while the PR is still a draft.
           core.setOutput('is_draft', String(isDraft));
@@ -550,6 +558,14 @@ runs:
         BASE: origin/${{ steps.pr.outputs.base }}
         HEAD: ${{ steps.pr.outputs.head_sha }}
         INSTRUCTION: ${{ github.action_path }}/rules/severity-instruction.md
+        # Untrusted-data framing prepended to the project-conventions doc that
+        # we extract from the BASE revision and inline into the background file
+        # (see the review step): tells the engine the doc may only suppress
+        # style findings, never weaken correctness/security or alter severity.
+        CONVENTIONS_DIRECTIVE: ${{ github.action_path }}/rules/conventions-directive.md
+        # Only load conventions when the PR targets the default branch (base is
+        # then a protected ref the PR author cannot rewrite). See the pr step.
+        BASE_IS_DEFAULT: ${{ steps.pr.outputs.base_is_default }}
         GATE: ${{ github.action_path }}/scripts/gate.mjs
         CHECK: ${{ github.action_path }}/scripts/check-result.mjs
         PROXY: ${{ github.action_path }}/scripts/fact-proxy.mjs
@@ -630,18 +646,50 @@ runs:
           printf '{"x-cr-prev-tier":"%s","x-cr-prev-p0p1":"%s"}' "$1" "$2" > "$FACTS_FILE"
         }
 
-        # The --background content: severity rubric + tag mandate. A non-empty
-        # server rubric (dashboard settings) REPLACES the built-in
-        # rules/severity-instruction.md wholesale — the [P0]/[P1]/[P2] tag
-        # mandate must live in that server text; the untagged->P1 fail-safe
-        # still catches any slippage. It rides on --background (additive)
-        # rather than --rule: --rule is the highest-priority layer and would
-        # REPLACE OCR's built-in language/security rules wholesale, gutting
-        # the bug-finding we advertise. --background layers on top of those.
-        BACKGROUND="$INSTRUCTION"
+        # The review background is assembled into a FILE, then passed inline via
+        # --background "$(cat …)" (the pinned engine 1.3.13 has no
+        # --background-file flag). On Linux the arg comfortably holds our sizes
+        # (severity rubric ~6 KB + a typical AGENTS.md). Two parts:
+        #   1. Severity rubric + [P0]-[P3] tag mandate (rules/severity-instruction.md,
+        #      or the dashboard's server-side override, which REPLACES it wholesale;
+        #      the untagged->P1 fail-safe still catches slippage). This rides the
+        #      background, NOT --rule: a --rule glob REPLACES OCR's built-in
+        #      language/security checklist for matched files, and the rubric is
+        #      explicitly ADDITIVE on top of that checklist — moving it to --rule
+        #      would delete the "what to look for" the rubric depends on.
+        #   2. Project conventions, read from the BASE revision — never the PR
+        #      head (the engine's file tools can only read the head version, so
+        #      we extract the doc ourselves) — and ONLY when the base is the
+        #      repo's default branch: a PR base is author-chosen, so an untrusted
+        #      base could itself be attacker-controlled. Inlined below, framed as
+        #      untrusted data that may only SUPPRESS style findings, and capped so
+        #      a large doc cannot push the inlined arg past the OS argv limit.
+        BACKGROUND="$RUNNER_TEMP/cr-background.md"
         if [ -n "$RUBRIC_FILE" ] && [ -s "$RUBRIC_FILE" ]; then
-          BACKGROUND="$RUBRIC_FILE"
+          cp "$RUBRIC_FILE" "$BACKGROUND"
           echo "Severity rubric: using the dashboard's server-side override."
+        else
+          cp "$INSTRUCTION" "$BACKGROUND"
+        fi
+
+        # Append the first conventions doc found at the base revision. $BASE is
+        # origin/<base ref>; when it is the default branch it is a protected ref
+        # the PR author cannot rewrite, so `git show "$BASE:<path>"` is trusted.
+        CONVENTIONS_MAX_BYTES=32768
+        if [ "$BASE_IS_DEFAULT" = "true" ] && [ -s "$CONVENTIONS_DIRECTIVE" ]; then
+          for f in AGENTS.md CLAUDE.md CONTRIBUTING.md; do
+            if doc=$(git show "$BASE:$f" 2>/dev/null | head -c "$CONVENTIONS_MAX_BYTES") && [ -n "$doc" ]; then
+              {
+                printf '\n\n'
+                cat "$CONVENTIONS_DIRECTIVE"
+                printf '\n\n----- BEGIN %s (untrusted project conventions; read-only reference) -----\n' "$f"
+                printf '%s\n' "$doc"
+                printf -- '----- END %s -----\n' "$f"
+              } >> "$BACKGROUND"
+              echo "Project conventions: inlined $f from the base revision ($BASE)."
+              break
+            fi
+          done
         fi
 
         # One engine pass into $1; returns nonzero on an unusable/partial
