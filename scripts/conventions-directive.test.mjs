@@ -33,13 +33,13 @@ describe("project-conventions directive: base-revision extraction", () => {
     assert.doesNotMatch(yml, /SAME_REPO/, "the SAME_REPO guard must be removed");
   });
 
-  test("the background is passed as a file, and the doc is inlined into it", () => {
+  test("the background is assembled into a file and inlined into --background", () => {
     const yml = read("action.yml");
-    // --background-file (a path) sidesteps the argv size limit that inline
-    // --background "$(cat …)" hit on large docs.
-    assert.match(yml, /--background-file "\$BACKGROUND"/, "must invoke with --background-file");
-    assert.doesNotMatch(yml, /--background "\$\(cat "\$BACKGROUND"\)"/, "must not inline the background via argv");
-    // The extracted doc is appended after the untrusted-data framing.
+    // The pinned engine (1.3.13) has no --background-file flag, so the assembled
+    // file is passed inline. The base-revision doc is appended to that file
+    // after the untrusted-data framing.
+    assert.match(yml, /--background "\$\(cat "\$BACKGROUND"\)"/, "must pass the background inline (1.3.13 has no --background-file)");
+    assert.doesNotMatch(yml, /--background-file "/, "must not invoke the unsupported --background-file flag");
     assert.match(yml, /cat "\$CONVENTIONS_DIRECTIVE"/, "the framing directive must precede the inlined doc");
     assert.match(yml, />> "\$BACKGROUND"/, "the doc must be appended to the background file");
   });

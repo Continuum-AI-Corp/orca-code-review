@@ -635,10 +635,10 @@ runs:
           printf '{"x-cr-prev-tier":"%s","x-cr-prev-p0p1":"%s"}' "$1" "$2" > "$FACTS_FILE"
         }
 
-        # The review background is assembled into a FILE and passed via
-        # --background-file, not inline --background "$(cat …)": a file path is
-        # bounded only by the engine's own limit (>=30k chars, verified), while
-        # inlining hit the OS argv limit on large docs. Two parts:
+        # The review background is assembled into a FILE, then passed inline via
+        # --background "$(cat …)" (the pinned engine 1.3.13 has no
+        # --background-file flag). On Linux the arg comfortably holds our sizes
+        # (severity rubric ~6 KB + a typical AGENTS.md). Two parts:
         #   1. Severity rubric + [P0]-[P3] tag mandate (rules/severity-instruction.md,
         #      or the dashboard's server-side override, which REPLACES it wholesale;
         #      the untagged->P1 fail-safe still catches slippage). This rides the
@@ -688,7 +688,7 @@ runs:
           echo "::group::Review — $2"
           rc=0
           ocr review --from "$BASE" --to "$HEAD" \
-            --background-file "$BACKGROUND" --format json \
+            --background "$(cat "$BACKGROUND")" --format json \
             > "$1" 2> "$REVIEW_LOG" || rc=$?
           cat "$REVIEW_LOG"
           echo "::endgroup::"
