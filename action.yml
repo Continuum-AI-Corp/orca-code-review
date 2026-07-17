@@ -157,15 +157,13 @@ runs:
       with:
         github-token: ${{ inputs.github-token }}
         script: |
-          let base, headSha, num, isDraft, authorAssoc, headRepo, baseRepo;
+          let base, headSha, num, isDraft, authorAssoc;
           if (context.eventName === 'pull_request_target') {
             base = context.payload.pull_request.base.ref;
             headSha = context.payload.pull_request.head.sha;
             num = context.payload.pull_request.number;
             isDraft = context.payload.pull_request.draft === true;
             authorAssoc = context.payload.pull_request.author_association || 'NONE';
-            headRepo = context.payload.pull_request.head.repo && context.payload.pull_request.head.repo.full_name;
-            baseRepo = context.payload.pull_request.base.repo.full_name;
           } else {
             num = context.issue.number;
             const { data: pr } = await github.rest.pulls.get({
@@ -174,18 +172,10 @@ runs:
             base = pr.base.ref; headSha = pr.head.sha;
             isDraft = pr.draft === true;
             authorAssoc = pr.author_association || 'NONE';
-            headRepo = pr.head.repo && pr.head.repo.full_name;
-            baseRepo = pr.base.repo.full_name;
           }
           core.setOutput('base', base);
           core.setOutput('head_sha', headSha);
           core.setOutput('number', String(num));
-          // Same-repo only when the PR head lives in the base repo (not a fork).
-          // A deleted-fork head.repo is null -> not same-repo. This gates the
-          // project-conventions directive: on a fork PR the head-checked-out
-          // AGENTS.md/CLAUDE.md is attacker-controlled, so we must not instruct
-          // the engine to read it as trusted convention.
-          core.setOutput('same_repo', String(!!(headRepo && baseRepo && headRepo === baseRepo)));
           // Draft state feeds the settings gate: trigger=ready_for_review
           // skips auto-reviews while the PR is still a draft.
           core.setOutput('is_draft', String(isDraft));
@@ -560,11 +550,11 @@ runs:
         BASE: origin/${{ steps.pr.outputs.base }}
         HEAD: ${{ steps.pr.outputs.head_sha }}
         INSTRUCTION: ${{ github.action_path }}/rules/severity-instruction.md
-        # Points the engine at the repo's own AGENTS.md/CLAUDE.md for project
-        # conventions — appended to --background ONLY on same-repo PRs (see
-        # SAME_REPO): a fork's checked-out conventions doc is attacker-controlled.
+        # Untrusted-data framing prepended to the project-conventions doc that
+        # we extract from the BASE revision and inline into the background file
+        # (see the review step): tells the engine the doc may only suppress
+        # style findings, never weaken correctness/security or alter severity.
         CONVENTIONS_DIRECTIVE: ${{ github.action_path }}/rules/conventions-directive.md
-        SAME_REPO: ${{ steps.pr.outputs.same_repo }}
         GATE: ${{ github.action_path }}/scripts/gate.mjs
         CHECK: ${{ github.action_path }}/scripts/check-result.mjs
         PROXY: ${{ github.action_path }}/scripts/fact-proxy.mjs
@@ -645,31 +635,47 @@ runs:
           printf '{"x-cr-prev-tier":"%s","x-cr-prev-p0p1":"%s"}' "$1" "$2" > "$FACTS_FILE"
         }
 
-        # The --background content: severity rubric + tag mandate. A non-empty
-        # server rubric (dashboard settings) REPLACES the built-in
-        # rules/severity-instruction.md wholesale — the [P0]/[P1]/[P2] tag
-        # mandate must live in that server text; the untagged->P1 fail-safe
-        # still catches any slippage. It rides on --background (additive)
-        # rather than --rule: --rule is the highest-priority layer and would
-        # REPLACE OCR's built-in language/security rules wholesale, gutting
-        # the bug-finding we advertise. --background layers on top of those.
-        BACKGROUND="$INSTRUCTION"
+        # The review background is assembled into a FILE and passed via
+        # --background-file, not inline --background "$(cat …)": a file path is
+        # bounded only by the engine's own limit (>=30k chars, verified), while
+        # inlining hit the OS argv limit on large docs. Two parts:
+        #   1. Severity rubric + [P0]-[P3] tag mandate (rules/severity-instruction.md,
+        #      or the dashboard's server-side override, which REPLACES it wholesale;
+        #      the untagged->P1 fail-safe still catches slippage). This rides the
+        #      background, NOT --rule: a --rule glob REPLACES OCR's built-in
+        #      language/security checklist for matched files, and the rubric is
+        #      explicitly ADDITIVE on top of that checklist — moving it to --rule
+        #      would delete the "what to look for" the rubric depends on.
+        #   2. Project conventions, read from the BASE revision (merged, reviewed,
+        #      immutable by this PR) — never the PR head, whose AGENTS.md a fork
+        #      author controls. The engine's file tools can only read the head
+        #      version, so we extract the doc ourselves and inline it below,
+        #      framed as untrusted data that may only SUPPRESS style findings.
+        BACKGROUND="$RUNNER_TEMP/cr-background.md"
         if [ -n "$RUBRIC_FILE" ] && [ -s "$RUBRIC_FILE" ]; then
-          BACKGROUND="$RUBRIC_FILE"
+          cp "$RUBRIC_FILE" "$BACKGROUND"
           echo "Severity rubric: using the dashboard's server-side override."
+        else
+          cp "$INSTRUCTION" "$BACKGROUND"
         fi
 
-        # Same-repo PRs only: append the project-conventions directive so the
-        # engine reads the repo's own AGENTS.md/CLAUDE.md and stops flagging
-        # deliberate project choices. Skipped on fork PRs — their head-checked-out
-        # conventions doc is attacker-controlled, and the directive tells the
-        # engine to trust that file. Rides --background (well under the engine's
-        # cap; the directive is short and never inlines the conventions doc).
-        if [ "$SAME_REPO" = "true" ] && [ -s "$CONVENTIONS_DIRECTIVE" ]; then
-          COMBINED_BG="$RUNNER_TEMP/cr-background.md"
-          cat "$BACKGROUND" "$CONVENTIONS_DIRECTIVE" > "$COMBINED_BG"
-          BACKGROUND="$COMBINED_BG"
-          echo "Project conventions: engine will read the repo's AGENTS.md/CLAUDE.md."
+        # Append the first conventions doc that exists at the base revision.
+        # $BASE is origin/<base ref>, so `git show "$BASE:<path>"` reads the
+        # trusted base content regardless of same-repo vs fork.
+        if [ -s "$CONVENTIONS_DIRECTIVE" ]; then
+          for f in AGENTS.md CLAUDE.md CONTRIBUTING.md; do
+            if doc=$(git show "$BASE:$f" 2>/dev/null) && [ -n "$doc" ]; then
+              {
+                printf '\n\n'
+                cat "$CONVENTIONS_DIRECTIVE"
+                printf '\n\n----- BEGIN %s (untrusted project conventions; read-only reference) -----\n' "$f"
+                printf '%s\n' "$doc"
+                printf -- '----- END %s -----\n' "$f"
+              } >> "$BACKGROUND"
+              echo "Project conventions: inlined $f from the base revision ($BASE)."
+              break
+            fi
+          done
         fi
 
         # One engine pass into $1; returns nonzero on an unusable/partial
@@ -682,7 +688,7 @@ runs:
           echo "::group::Review — $2"
           rc=0
           ocr review --from "$BASE" --to "$HEAD" \
-            --background "$(cat "$BACKGROUND")" --format json \
+            --background-file "$BACKGROUND" --format json \
             > "$1" 2> "$REVIEW_LOG" || rc=$?
           cat "$REVIEW_LOG"
           echo "::endgroup::"

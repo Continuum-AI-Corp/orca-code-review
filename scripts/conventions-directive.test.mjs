@@ -1,10 +1,12 @@
 // Pins the project-conventions directive wiring — a SECURITY property, so a
 // refactor can't silently drop it. The directive points the engine at the
-// repo's own AGENTS.md/CLAUDE.md for project conventions, but that doc lives in
-// the PR head checkout: on a FORK PR it is attacker-controlled. So the directive
-// must (1) only ride --background on same-repo PRs, gated by the `same_repo`
-// output the `pr` step derives from head/base repo identity, and (2) frame the
-// doc as untrusted data that can never weaken the review or change severity tags.
+// repo's own AGENTS.md/CLAUDE.md for project conventions. That doc is
+// attacker-controlled on a fork PR head, so we NEVER read the head copy:
+// the driver extracts it from the BASE revision (merged, reviewed, immutable
+// by the PR) via `git show "$BASE:<path>"` and inlines it into the background
+// file, framed as untrusted data that can never weaken the review or change
+// severity tags. Size is safe because we pass --background-file (a path), not
+// an inline --background argv value.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -15,24 +17,31 @@ import assert from "node:assert/strict";
 const SCRIPTS = dirname(fileURLToPath(import.meta.url));
 const read = (rel) => readFileSync(join(SCRIPTS, "..", rel), "utf8");
 
-describe("project-conventions directive: fork-injection gate", () => {
-  test("the pr step derives same_repo from head/base repo full_name", () => {
+describe("project-conventions directive: base-revision extraction", () => {
+  test("conventions are read from the BASE revision, not the PR head", () => {
     const yml = read("action.yml");
-    assert.match(yml, /core\.setOutput\('same_repo'/, "pr step must publish a same_repo output");
-    // Both event paths must resolve head.repo full_name (fork detection).
-    assert.match(yml, /head\.repo && context\.payload\.pull_request\.head\.repo\.full_name/);
-    assert.match(yml, /pr\.head\.repo && pr\.head\.repo\.full_name/);
-  });
-
-  test("the directive is appended to --background ONLY when SAME_REPO is true", () => {
-    const yml = read("action.yml");
+    // The doc is pulled from $BASE (origin/<base ref>) via git show — the
+    // trusted base content — for the three accepted filenames in order.
     assert.match(
       yml,
-      /if \[ "\$SAME_REPO" = "true" \] && \[ -s "\$CONVENTIONS_DIRECTIVE" \]; then/,
-      "the conventions directive must be guarded by SAME_REPO == true",
+      /for f in AGENTS\.md CLAUDE\.md CONTRIBUTING\.md; do/,
+      "must try AGENTS.md, CLAUDE.md, CONTRIBUTING.md in order",
     );
-    // The guard must wrap the concatenation, not sit beside an unconditional one.
-    assert.match(yml, /cat "\$BACKGROUND" "\$CONVENTIONS_DIRECTIVE" > "\$COMBINED_BG"/);
+    assert.match(yml, /git show "\$BASE:\$f"/, "must extract the doc from the base revision");
+    // The head-trust gate is gone: no same_repo output, no SAME_REPO guard.
+    assert.doesNotMatch(yml, /same_repo/, "the same_repo head gate must be removed");
+    assert.doesNotMatch(yml, /SAME_REPO/, "the SAME_REPO guard must be removed");
+  });
+
+  test("the background is passed as a file, and the doc is inlined into it", () => {
+    const yml = read("action.yml");
+    // --background-file (a path) sidesteps the argv size limit that inline
+    // --background "$(cat …)" hit on large docs.
+    assert.match(yml, /--background-file "\$BACKGROUND"/, "must invoke with --background-file");
+    assert.doesNotMatch(yml, /--background "\$\(cat "\$BACKGROUND"\)"/, "must not inline the background via argv");
+    // The extracted doc is appended after the untrusted-data framing.
+    assert.match(yml, /cat "\$CONVENTIONS_DIRECTIVE"/, "the framing directive must precede the inlined doc");
+    assert.match(yml, />> "\$BACKGROUND"/, "the doc must be appended to the background file");
   });
 
   test("the directive frames the doc as untrusted and severity-preserving", () => {
