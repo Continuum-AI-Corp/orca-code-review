@@ -205,6 +205,37 @@ runs:
           core.setOutput('tier', promoted ? '1' : '0');
           core.info(`PR #${num} review tier: ${promoted ? '1 (strong)' : '0 (cheap)'}`);
 
+    # Lightweight 👀 acknowledgement so the requester sees the bot noticed the
+    # trigger. Static one-shot (no update or removal). Fires early — before any
+    # skip gate — so even a skipped run still visibly acknowledges receipt.
+    # Reaction outages are non-fatal: the review must never be blocked by a
+    # UI-affordance failure.
+    - name: React 👀 to acknowledge review request
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+        EVENT_NAME: ${{ github.event_name }}
+        COMMENT_ID: ${{ github.event.comment.id }}
+      run: |
+        react() {
+          if gh api -X POST "$1" -f content=eyes >/dev/null 2>&1; then
+            echo "reacted 👀 -> $1"
+          else
+            echo "warning: failed to react at $1 (non-fatal)"
+          fi
+        }
+        # Always react on the PR body (issue reactions endpoint — PRs are issues).
+        if [ -n "${PR_NUMBER:-}" ]; then
+          react "repos/$REPO/issues/$PR_NUMBER/reactions"
+        fi
+        # For a maintainer's /orcarouter-review command, also react on that
+        # trigger comment so the operator sees direct feedback on THEIR comment.
+        if [ "$EVENT_NAME" = "issue_comment" ] && [ -n "${COMMENT_ID:-}" ]; then
+          react "repos/$REPO/issues/comments/$COMMENT_ID/reactions"
+        fi
+
     # setup-node runs BEFORE checkout (it never reads the workspace) so the
     # settings fetch below has node available even on a bare self-hosted runner.
     - uses: actions/setup-node@v4
