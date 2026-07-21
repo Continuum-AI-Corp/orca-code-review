@@ -571,7 +571,7 @@ describe("action.yml: gate_decision — shared auto-event gate (both settings pa
     });
 
     test("a comment command (issue_comment) still proceeds even for a disallowed author", () => {
-      // On-demand /orcarouter-review is maintainer-gated in the workflow `if:`;
+      // On-demand /orca-code-review is maintainer-gated in the workflow `if:`;
       // the settings gate must NOT additionally skip it.
       assert.equal(disabled({ event: "issue_comment", list: "CONTRIBUTOR", assoc: "NONE" }).decision, "review");
     });

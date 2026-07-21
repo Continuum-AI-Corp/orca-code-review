@@ -42,7 +42,7 @@ for public repos:
 - **Restrict auto-review authors** with the `auto-review-authors` input (e.g.
   `OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR`) so anonymous/first-time PRs are not
   auto-reviewed. They can still be reviewed on demand by a maintainer's
-  `/orcarouter-review` comment, which is separately gated to
+  `/orca-code-review` comment, which is separately gated to
   OWNER/MEMBER/COLLABORATOR.
 
 ### `pull_request_target` and secrets
@@ -54,7 +54,7 @@ to read. Consumers MUST NOT add build, test, or install steps that execute
 PR-controlled code to this workflow. If you need to run PR code, do it in a
 separate `pull_request`-triggered workflow with no secrets.
 
-The comment trigger (`/orcarouter-review`) is gated to
+The comment trigger (`/orca-code-review`) is gated to
 OWNER/MEMBER/COLLABORATOR in the shipped workflow so arbitrary commenters
 cannot spend your quota.
 
