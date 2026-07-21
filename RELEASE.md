@@ -32,7 +32,7 @@ When cutting a release from a merged feature branch:
 
 Until the tag is moved, do not advertise the new inputs under `@v1`. For
 pre-release dogfooding, pin an immutable commit SHA (as OrcaRouter-O2's own
-`.github/workflows/orcarouter-code-review.yml` does) rather than `@v1`.
+`.github/workflows/orca-code-review.yml` does) rather than `@v1`.
 
 ## Marketplace
 
