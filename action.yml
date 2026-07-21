@@ -1,7 +1,7 @@
 # Orca-Code-Review — reusable composite action.
 #
 # Consumers reference this with `uses:` instead of copying the folder; see
-# workflows/orcarouter-code-review.yml for the ~15-line example workflow.
+# workflows/orca-code-review.yml for the ~15-line example workflow.
 #
 # Single-tier review (gpt-5.5): one review pass per run. The cheap->strong
 # cascade was retired after testing showed the cheap tier added no value online

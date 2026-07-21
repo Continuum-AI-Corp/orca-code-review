@@ -76,8 +76,8 @@ merge.
      it as an external **Connection** under Integrations, then reference it from
      a guardrail rule. OSV is free/public; Snyk and Semgrep need their own keys.
 
-3. Add this workflow at **`.github/workflows/orcarouter-code-review.yml`**
-   (copy from [`workflows/orcarouter-code-review.yml`](./workflows/orcarouter-code-review.yml)):
+3. Add this workflow at **`.github/workflows/orca-code-review.yml`**
+   (copy from [`workflows/orca-code-review.yml`](./workflows/orca-code-review.yml)):
 
    ```yaml
    name: Orca-Code-Review
