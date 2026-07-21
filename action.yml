@@ -84,7 +84,7 @@ inputs:
       paid cascades by opening PRs — set e.g.
       "OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR" to auto-review only known
       contributors (others can still be reviewed on demand via
-      /orcarouter-review). Also set a wallet budget + alert on the key.
+      /orca-code-review). Also set a wallet budget + alert on the key.
       Case-insensitive; values: OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR,
       FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, MANNEQUIN, NONE.
     required: false
@@ -205,6 +205,37 @@ runs:
           core.setOutput('tier', promoted ? '1' : '0');
           core.info(`PR #${num} review tier: ${promoted ? '1 (strong)' : '0 (cheap)'}`);
 
+    # Lightweight 👀 acknowledgement so the requester sees the bot noticed the
+    # trigger. Static one-shot (no update or removal). Fires early — before any
+    # skip gate — so even a skipped run still visibly acknowledges receipt.
+    # Reaction outages are non-fatal: the review must never be blocked by a
+    # UI-affordance failure.
+    - name: React 👀 to acknowledge review request
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ steps.pr.outputs.number }}
+        EVENT_NAME: ${{ github.event_name }}
+        COMMENT_ID: ${{ github.event.comment.id }}
+      run: |
+        react() {
+          if gh api -X POST "$1" -f content=eyes >/dev/null 2>&1; then
+            echo "reacted 👀 -> $1"
+          else
+            echo "warning: failed to react at $1 (non-fatal)"
+          fi
+        }
+        # Always react on the PR body (issue reactions endpoint — PRs are issues).
+        if [ -n "${PR_NUMBER:-}" ]; then
+          react "repos/$REPO/issues/$PR_NUMBER/reactions"
+        fi
+        # For a maintainer's /orca-code-review command, also react on that
+        # trigger comment so the operator sees direct feedback on THEIR comment.
+        if [ "$EVENT_NAME" = "issue_comment" ] && [ -n "${COMMENT_ID:-}" ]; then
+          react "repos/$REPO/issues/comments/$COMMENT_ID/reactions"
+        fi
+
     # setup-node runs BEFORE checkout (it never reads the workspace) so the
     # settings fetch below has node available even on a bare self-hosted runner.
     - uses: actions/setup-node@v4
@@ -260,7 +291,7 @@ runs:
         # Auto-event gate -> sets DECISION/REASON. Only AUTO runs are gated —
         # any pull_request* event, so a hand-written plain `pull_request`
         # workflow honors gating exactly like the documented
-        # `pull_request_target` one. An explicit `/orcarouter-review` comment
+        # `pull_request_target` one. An explicit `/orca-code-review` comment
         # command (issue_comment) always proceeds — on-demand mode exists
         # precisely for those, and a human asking for a review of a
         # draft/disabled repo is deliberate. Shared by both settings paths so the
@@ -390,7 +421,7 @@ runs:
             `${MARKER}\n## 🐳 ${brand}\n\n` +
             `⏸️ **Automatic review is off for this PR** (${process.env.REASON}).\n\n` +
             `The check **passes** — this never blocks your merge. A maintainer can still ` +
-            `run a review on demand by commenting \`/orcarouter-review\`, or change the ` +
+            `run a review on demand by commenting \`/orca-code-review\`, or change the ` +
             `repo's review settings in the OrcaRouter dashboard.` +
             footer;
 
