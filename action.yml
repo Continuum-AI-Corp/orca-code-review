@@ -128,6 +128,17 @@ inputs:
     description: "Pinned @alibaba-group/open-code-review version (the review engine). Bump deliberately after testing — the later steps parse its JSON output shape."
     required: false
     default: "1.3.13"
+  timeout-minutes:
+    description: >-
+      Wall-clock ceiling (in minutes) for ONE engine review pass. If the engine
+      hasn't produced a result within this window it is killed and the run
+      fails closed with a distinct "wall-clock timeout" error (separate from
+      "no usable result", so the log makes clear which mode failed). Accepts
+      decimals (e.g. "0.5" = 30 seconds) for testing. Default 20 covers most
+      PRs on shipped models; bump for very large diffs or slow-per-call
+      models where per-file review takes longer.
+    required: false
+    default: "20"
 
 runs:
   using: "composite"
@@ -149,7 +160,8 @@ runs:
           "$RUNNER_TEMP/cr-settings.json" "$RUNNER_TEMP/cr-rubric.md" \
           "$RUNNER_TEMP/cr-facts.json" "$RUNNER_TEMP/proxy.out" "$RUNNER_TEMP/proxy.err" \
           "$RUNNER_TEMP/policy-block.json" \
-          "$RUNNER_TEMP/pr.diff" "$RUNNER_TEMP/diff-guard.json" "$RUNNER_TEMP/prev-summary.md"
+          "$RUNNER_TEMP/pr.diff" "$RUNNER_TEMP/diff-guard.json" "$RUNNER_TEMP/prev-summary.md" \
+          "$RUNNER_TEMP/wallclock-timeout"
 
     - name: Resolve PR refs
       id: pr
@@ -580,6 +592,10 @@ runs:
       env:
         TIER_STATE: ${{ steps.pr.outputs.tier }}
         ROUTER: ${{ inputs.router }}
+        # Wall-clock ceiling for ONE engine pass; wrapped around `ocr review`
+        # via GNU `timeout` inside run_pass. Passed as-is (units are minutes;
+        # decimals accepted, e.g. "0.5" = 30s). See the input docstring.
+        TIMEOUT_MIN: ${{ inputs.timeout-minutes }}
         # Effective value after the settings/input precedence rule.
         FIX_FIRST: ${{ steps.settings.outputs.fix_first }}
         # Non-empty only when the dashboard supplies a replacement rubric.
@@ -732,10 +748,22 @@ runs:
           set_facts "$3" "$4"
           echo "::group::Review — $2"
           rc=0
-          ocr review --from "$BASE" --to "$HEAD" \
-            --background "$(cat "$BACKGROUND")" --format json \
-            > "$1" 2> "$REVIEW_LOG" || rc=$?
+          # Wall-clock guard: SIGTERM at TIMEOUT_MIN; SIGKILL 10s later if the
+          # engine ignored the term. Redirections apply to whatever `timeout`
+          # runs — i.e. ocr's own stdout/stderr — so the JSON result and log
+          # end up in the same files as before.
+          timeout --kill-after=10s "${TIMEOUT_MIN}m" \
+            ocr review --from "$BASE" --to "$HEAD" \
+              --background "$(cat "$BACKGROUND")" --format json \
+              > "$1" 2> "$REVIEW_LOG" || rc=$?
           cat "$REVIEW_LOG"
+          # 124 = GNU timeout tripped (SIGTERM); 137 = 128+9, i.e. --kill-after
+          # escalated to SIGKILL. Leave a marker so run_review can print a
+          # wall-clock-specific error (distinct from "no usable result").
+          if [ "$rc" = "124" ] || [ "$rc" = "137" ]; then
+            echo "::warning::Engine wall-clock timeout after ${TIMEOUT_MIN} minute(s) (rc=$rc)."
+            printf 'wall-clock timeout after %sm\n' "$TIMEOUT_MIN" > "$RUNNER_TEMP/wallclock-timeout"
+          fi
           echo "::endgroup::"
           node "$CHECK" "$1" "$rc"
         }
@@ -754,7 +782,11 @@ runs:
         #   $4 = extra passes allowed (true only on the strong tier)
         run_review() {
           if ! run_pass "$RESULT" "$1" "$2" "$3"; then
-            echo "::error::$BRAND: review engine produced no usable result — failing closed."
+            if [ -f "$RUNNER_TEMP/wallclock-timeout" ]; then
+              echo "::error::$BRAND: $(cat "$RUNNER_TEMP/wallclock-timeout") — engine killed, failing closed. Bump the 'timeout-minutes' input for very large PRs or slow-per-call models."
+            else
+              echo "::error::$BRAND: review engine produced no usable result — failing closed."
+            fi
             exit 1
           fi
           PASSES=1
@@ -1271,4 +1303,5 @@ runs:
           "$RUNNER_TEMP/cr-settings.json" "$RUNNER_TEMP/cr-rubric.md" \
           "$RUNNER_TEMP/cr-facts.json" "$RUNNER_TEMP/proxy.out" "$RUNNER_TEMP/proxy.err" \
           "$RUNNER_TEMP/policy-block.json" \
-          "$RUNNER_TEMP/pr.diff" "$RUNNER_TEMP/diff-guard.json" "$RUNNER_TEMP/prev-summary.md"
+          "$RUNNER_TEMP/pr.diff" "$RUNNER_TEMP/diff-guard.json" "$RUNNER_TEMP/prev-summary.md" \
+          "$RUNNER_TEMP/wallclock-timeout"
