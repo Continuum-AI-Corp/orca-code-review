@@ -135,6 +135,7 @@ All optional — pass as `with:` inputs on the action:
 | `report` | `true` | Send a per-run summary (severity counts only — never code) to the OrcaRouter control plane; set `"false"` to disable — see [Run reporting](#run-reporting) |
 | `github-token` | `${{ github.token }}` | Token used to fetch the PR head, post review comments, and manage the tier label; override only if the default `GITHUB_TOKEN` lacks the needed scopes |
 | `engine-version` | `1.3.13` | Pinned `@alibaba-group/open-code-review` version (the review engine); bump deliberately after testing — later steps parse its JSON output shape |
+| `timeout-minutes` | `20` | Wall-clock ceiling (in minutes) for one engine review pass. If the engine hasn't produced a result within this window it is killed and the check fails closed with a distinct `wall-clock timeout` error (separate from the "no usable result" mode, so the log tells you which one tripped). Accepts decimals (e.g. `"0.5"` = 30s) for testing. Bump for very large diffs or slow-per-call models where per-file review takes longer. In `exhaustive` mode each engine pass has its own budget, so the worst-case whole-review wall time is `timeout-minutes × 3`. |
 
 `fix-first` and `block-on` can also be set per-repo from the OrcaRouter
 dashboard — see the precedence rule under

@@ -60,3 +60,4 @@ jobs:
           # on-oversized-diff: "fail"  # oversized skip fails the check; "pass" makes it advisory
           # settings: "true"     # "false" skips the dashboard fetch — this file is authoritative
           # report: "true"       # per-run severity counts (never code) to your control plane
+          # timeout-minutes: "20"  # wall-clock ceiling per engine pass; bump for very large PRs
