@@ -84,7 +84,11 @@ const user = `Findings (JSON):\n${JSON.stringify(findings, null, 1)}`;
 const body = JSON.stringify({
   model: judgeModel,
   temperature: 0,
-  max_tokens: 8000,
+  // Scales with the finding count (~250 tokens per cluster JSON entry —
+  // member_ids + representative_id + confidence + keep + root_cause + reason —
+  // plus a bit of overhead). 8k tokens truncated the response at 48 findings
+  // (observed on minimax runs on 80bffaa72); 32k gives headroom well past 100.
+  max_tokens: 32000,
   messages: [{ role: "system", content: system }, { role: "user", content: user }],
 });
 
