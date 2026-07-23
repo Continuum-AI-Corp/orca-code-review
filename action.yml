@@ -141,37 +141,30 @@ inputs:
     default: "20"
   precision-filter:
     description: >-
-      Precision post-processing between the engine and the merge gate.
-      "true" (default) runs two layers on the raw engine findings before the
-      gate: (L1) a deterministic filter that git-greps each finding's own
-      `existing_code` snippet against the reviewed commit and re-homes or drops
-      findings mis-filed onto files that do not contain the referenced code
-      (the "same finding copy-pasted across unrelated files" FP pattern seen
-      on large PRs), then (L2) a single-call LLM judge from an INDEPENDENT
-      vendor that clusters findings by root cause and drops speculative /
-      low-value ones below a confidence threshold. Set to "false" to post the
-      engine's raw findings directly (useful for debugging a regression).
-      Both layers are soft-fail — an error in either keeps the prior stage's
-      findings and never aborts the review.
+      Post-processing between the engine and the merge gate. When `"true"`
+      (default), a deterministic filter (L1) verifies each finding's
+      `existing_code` snippet against the reviewed commit and re-homes or
+      drops findings whose snippet does not match the claimed path; then an
+      LLM judge (L2) clusters findings by root cause and drops
+      low-confidence ones. Set to `"false"` to post the engine's raw
+      findings directly. Both layers are soft-fail — errors keep the prior
+      stage's findings and never abort the review.
     required: false
     default: "true"
   judge-model:
     description: >-
-      Model used by the L2 judge stage of `precision-filter`. Should be
-      DIFFERENT from the reviewer model (independence is the point). Defaults
-      to `deepseek/deepseek-v4-pro` — good coverage on the whole finding set
-      in bakeoffs; cheap; single request per pass. Ignored when
-      `precision-filter` is "false".
+      Model used by the L2 judge stage. Should differ from the reviewer
+      model so the judge acts as an independent second opinion. Ignored when
+      `precision-filter` is `"false"`.
     required: false
     default: "deepseek/deepseek-v4-pro"
   judge-threshold:
     description: >-
       Keep-threshold for the L2 judge's per-cluster confidence score (0–1).
-      Findings with confidence below this are dropped. 0.7 (default) keeps
-      high-certainty clusters and drops speculative ones without cutting P2s
-      as a class. Lower to keep more; raise to be stricter.
+      Findings with confidence below this are dropped. Lower to keep more;
+      raise to be stricter.
     required: false
-    default: "0.7"
+    default: "0.5"
 
 runs:
   using: "composite"
