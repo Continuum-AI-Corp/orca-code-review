@@ -151,8 +151,10 @@ for (const g of groups) {
   // return 1 for `true` and 0 for `false`/`null`/`[]`, and 1 for `[1]`, any of
   // which would slip past ANY threshold and bypass the whole gate. Accept
   // only real numbers or numeric strings; anything else becomes NaN and the
-  // group is dropped as if `keep: false`. `boundedConf` is then clamped so
-  // even a stray `2` from a valid-typed but out-of-range value cannot bypass.
+  // group is dropped. Then reject values outside the documented [0,1] range
+  // outright rather than clamping — a stray `2` is a schema violation, and
+  // silently clamping it to `1` (max confidence) lets an invalid response
+  // survive every threshold. Match the invalid-type policy: violation → drop.
   const rawConfInput = g.confidence;
   const rawConf =
     typeof rawConfInput === "number"
@@ -160,7 +162,8 @@ for (const g of groups) {
       : typeof rawConfInput === "string"
         ? parseStrictDecimal(rawConfInput)
         : NaN;
-  const boundedConf = Number.isFinite(rawConf) ? Math.min(Math.max(rawConf, 0), 1) : NaN;
+  const boundedConf =
+    Number.isFinite(rawConf) && rawConf >= 0 && rawConf <= 1 ? rawConf : NaN;
   // Coerce `keep` strictly — same schema-drift class as `confidence` above.
   // Truthy JS treats the STRING `"false"` as true, so a raw `&& g.keep` would
   // retain a group the judge intended to drop when the LLM stringifies the

@@ -26,11 +26,26 @@ if (!file || !repo || !commit) {
 
 // Only drop findings whose snippet did NOT match anywhere in the tree when
 // the claimed path is a KNOWN non-code file (locale JSON / doc markdown /
-// changelogs / lockfiles). Extensionless code files (Dockerfile, Makefile,
-// scripts with no extension) previously fell through the "not code-ext"
-// branch and got dropped as if they were locale files — reverse the polarity
-// so only clearly-non-code paths incur the drop.
-const KNOWN_NON_CODE = /\.(json|ya?ml|md|txt|lock|log|csv|tsv|po|pot|properties|map|png|jpe?g|gif|svg|ico|webp|pdf|woff2?|ttf|eot|otf|zip|tar|gz|tgz|bin|exe|dll|so|dylib|class|jar|wasm|mp3|mp4|mov|wav)$/i;
+// changelogs / lockfiles / images / binaries). Extensionless code files
+// (Dockerfile, Makefile, scripts with no extension) previously fell through
+// the "not code-ext" branch and got dropped as if they were locale files —
+// reverse the polarity so only clearly-non-code paths incur the drop.
+//
+// Extensions that are ALWAYS non-code (docs, media, binaries, generated).
+const DEFINITELY_NON_CODE_EXT = /\.(md|txt|lock|log|csv|tsv|po|pot|properties|map|png|jpe?g|gif|svg|ico|webp|pdf|woff2?|ttf|eot|otf|zip|tar|gz|tgz|bin|exe|dll|so|dylib|class|jar|wasm|mp3|mp4|mov|wav)$/i;
+// JSON / YAML are ambiguous: action.yml, GitHub workflows, package.json,
+// tsconfig.json, k8s / IaC manifests are all reviewable configuration. Only
+// treat a .json / .yml / .yaml path as non-code when the path itself
+// signals "lockfile", "locale/translation bundle", or "generated build
+// output" — anything else keeps the finding for L2 to judge.
+const CONVENTIONAL_NON_CODE_JSON_YAML_PATH =
+  /(?:(?:^|\/)(?:package-lock|pnpm-lock)\.(?:json|ya?ml))|(?:[-.]lock\.(?:json|ya?ml)$)|(?:(?:^|\/)(?:locales?|i18n|translations|messages|dist|build|generated|out|coverage)\/)/i;
+function isKnownNonCode(p) {
+  if (!p) return false;
+  if (DEFINITELY_NON_CODE_EXT.test(p)) return true;
+  if (!/\.(?:json|ya?ml)$/i.test(p)) return false;
+  return CONVENTIONAL_NON_CODE_JSON_YAML_PATH.test(p);
+}
 
 // Returns a de-duped list of files containing `pattern` at the reviewed
 // commit. Uses `-l` (file-list only) so we sidestep the colon-in-filename
@@ -142,7 +157,7 @@ for (const c of comments) {
       }
     }
     else action = `keep (ambiguous: ${files.length} files)`;
-  } else if (KNOWN_NON_CODE.test(c.path)) {
+  } else if (isKnownNonCode(c.path)) {
     action = "DROP (code snippet, filed on known-non-code file, not found)";
   } else {
     action = "keep (snippet unverified)";
