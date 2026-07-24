@@ -821,15 +821,41 @@ runs:
               echo "::warning::L1 postfilter failed — keeping engine findings"
             fi
             L2_OUT="${1%.json}.l2.json"
+            # Snapshot the engine's policy-block CONTENT (not just presence)
+            # before the L2 sidecar. The judge call goes through fact-proxy,
+            # whose `recordPolicyBlock()` can OVERWRITE `$POLICY_BLOCK` if the
+            # judge itself hits a guardrail — a presence-only flag can't tell
+            # "engine block preserved" from "engine block silently replaced by
+            # L2 block". After the L2 call, if we snapshotted engine content
+            # we always restore it (both success and fail paths) so the
+            # engine's guardrail record wins over an L2 sidecar overwrite.
+            POLICY_BLOCK_SNAPSHOT="${POLICY_BLOCK}.pre-l2"
+            rm -f "$POLICY_BLOCK_SNAPSHOT"
+            if [ -f "$POLICY_BLOCK" ]; then cp -f "$POLICY_BLOCK" "$POLICY_BLOCK_SNAPSHOT"; fi
             if node "$JUDGE" "$1" --model "$JUDGE_MODEL" --threshold "$JUDGE_THRESHOLD" --out "$L2_OUT" 2>&1 \
                && [ -s "$L2_OUT" ]; then
               L2_IN_COUNT=$(node -pe "(require('$1').comments||[]).length")
               L2_OUT_COUNT=$(node -pe "(require('$L2_OUT').comments||[]).length")
               echo "L2 judge ($JUDGE_MODEL, thr=$JUDGE_THRESHOLD): $L2_IN_COUNT -> $L2_OUT_COUNT"
               mv "$L2_OUT" "$1"
+              # L2 succeeded. Restore engine's block if we snapshotted one —
+              # covers the case where L2 was warn-mode guardrail-hit and
+              # overwrote engine's authoritative record mid-call.
+              if [ -f "$POLICY_BLOCK_SNAPSHOT" ]; then
+                mv -f "$POLICY_BLOCK_SNAPSHOT" "$POLICY_BLOCK"
+              fi
             else
               echo "::warning::L2 judge failed — keeping L1 findings"
+              # L2 failed. Restore engine's block if we snapshotted one; else
+              # clear any L2-authored block so a sidecar guardrail hit doesn't
+              # surface as the engine's own block on the primary review.
+              if [ -f "$POLICY_BLOCK_SNAPSHOT" ]; then
+                mv -f "$POLICY_BLOCK_SNAPSHOT" "$POLICY_BLOCK"
+              else
+                rm -f "$POLICY_BLOCK"
+              fi
             fi
+            unset POLICY_BLOCK_SNAPSHOT
             echo "::endgroup::"
           fi
           node "$CHECK" "$1" "$rc"

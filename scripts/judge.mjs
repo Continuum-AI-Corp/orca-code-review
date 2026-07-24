@@ -17,11 +17,34 @@
 import fs from "node:fs";
 import os from "node:os";
 
+// Parses a strict plain decimal (e.g. "0.7", "-1", "0.5"). Returns the number
+// or NaN. Deliberately does NOT use parseFloat — parseFloat stops at the
+// first non-numeric character so "0.8oops" would silently become 0.8 and
+// "0x1" would become 0. The regex gate rejects any trailing garbage before
+// Number() coerces, so callers can trust the returned value is either a
+// clean decimal or NaN.
+function parseStrictDecimal(raw) {
+  if (typeof raw !== "string" || !/^\s*-?\d+(?:\.\d+)?\s*$/.test(raw)) return NaN;
+  return Number(raw);
+}
+
 const [file, ...rest] = process.argv.slice(2);
 let out = null, threshold = 0.7, modelOverride = null;
 for (let i = 0; i < rest.length; i += 1) {
   if (rest[i] === "--out") out = rest[++i];
-  else if (rest[i] === "--threshold") threshold = parseFloat(rest[++i]);
+  else if (rest[i] === "--threshold") {
+    const rawT = rest[++i];
+    const parsed = parseStrictDecimal(rawT);
+    if (!Number.isFinite(parsed)) {
+      console.error(`judge: --threshold must be a plain decimal, got ${JSON.stringify(rawT)}`);
+      process.exit(2);
+    }
+    if (parsed < 0 || parsed > 1) {
+      console.error(`judge: --threshold must be in [0,1], got ${JSON.stringify(rawT)}`);
+      process.exit(2);
+    }
+    threshold = parsed;
+  }
   else if (rest[i] === "--model") modelOverride = rest[++i];
 }
 if (!file) { console.error("usage: node judge.mjs <filtered.json> [--out f] [--threshold 0.7] [--model deepseek/deepseek-v4-pro]"); process.exit(2); }
@@ -86,8 +109,8 @@ const body = JSON.stringify({
   temperature: 0,
   // Scales with the finding count (~250 tokens per cluster JSON entry —
   // member_ids + representative_id + confidence + keep + root_cause + reason —
-  // plus a bit of overhead). 8k tokens truncated the response at 48 findings
-  // (observed on minimax runs on 80bffaa72); 32k gives headroom well past 100.
+  // plus a bit of overhead). 32k gives headroom well past 100 findings; 8k
+  // truncated the response on large batches in earlier testing.
   max_tokens: 32000,
   messages: [{ role: "system", content: system }, { role: "user", content: user }],
 });
@@ -112,18 +135,65 @@ catch (e) { console.error("judge did not return JSON:\n" + content.slice(0, 600)
 const groups = parsed.groups || [];
 const covered = new Set();
 for (const g of groups) for (const id of g.member_ids || []) covered.add(id);
+// Fail-open for findings the judge did not classify into any group: mark
+// them keep with a synthetic confidence that survives ANY user-set
+// threshold, so raising the threshold does not silently drop the judge's
+// blind spots (the previous 0.5 constant fails closed at threshold > 0.5,
+// contradicting the "fail-open" comment).
 for (let i = 0; i < findings.length; i += 1) if (!covered.has(i))
-  groups.push({ member_ids: [i], representative_id: i, confidence: 0.5, keep: true, root_cause: "(uncovered)", reason: "not classified by judge; kept fail-open" });
+  groups.push({ member_ids: [i], representative_id: i, confidence: 1.0, keep: true, root_cause: "(uncovered)", reason: "not classified by judge; kept fail-open above any threshold" });
 
 const kept = [];
 const dropped = [];
 for (const g of groups) {
-  const surv = g.keep && g.confidence >= threshold;
-  const rep = comments[g.representative_id] ?? comments[g.member_ids[0]];
-  const others = (g.member_ids || []).filter((id) => id !== (g.representative_id ?? g.member_ids[0]));
-  const line = `[conf ${g.confidence?.toFixed(2)}] ${(rep?.content || "").match(/\[(P[0-3])\]/)?.[0] || ""} ${rep?.path} :: ${g.root_cause} ${others.length ? "(merged " + others.length + ")" : ""}`;
-  if (surv) { kept.push(rep); console.error("KEEP  " + line); }
-  else { dropped.push(g); console.error("drop  " + line + " — " + (g.reason || "")); }
+  // Coerce confidence — the judge sometimes serializes it as a JSON string
+  // (e.g. "0.95") on schema drift. Type-guard first: `Number()` will happily
+  // return 1 for `true` and 0 for `false`/`null`/`[]`, and 1 for `[1]`, any of
+  // which would slip past ANY threshold and bypass the whole gate. Accept
+  // only real numbers or numeric strings; anything else becomes NaN and the
+  // group is dropped. Then reject values outside the documented [0,1] range
+  // outright rather than clamping — a stray `2` is a schema violation, and
+  // silently clamping it to `1` (max confidence) lets an invalid response
+  // survive every threshold. Match the invalid-type policy: violation → drop.
+  const rawConfInput = g.confidence;
+  const rawConf =
+    typeof rawConfInput === "number"
+      ? rawConfInput
+      : typeof rawConfInput === "string"
+        ? parseStrictDecimal(rawConfInput)
+        : NaN;
+  const boundedConf =
+    Number.isFinite(rawConf) && rawConf >= 0 && rawConf <= 1 ? rawConf : NaN;
+  // Coerce `keep` strictly — same schema-drift class as `confidence` above.
+  // Truthy JS treats the STRING `"false"` as true, so a raw `&& g.keep` would
+  // retain a group the judge intended to drop when the LLM stringifies the
+  // boolean. Accept only real `true` or the literal string "true" (case-
+  // insensitive); anything else drops the group as a safe default.
+  const keepInput = g.keep;
+  const groupKeep =
+    keepInput === true ||
+    (typeof keepInput === "string" && keepInput.trim().toLowerCase() === "true");
+  const surv = groupKeep && Number.isFinite(boundedConf) && boundedConf >= threshold;
+  // Resolve the representative comment by trying the primary id then every
+  // member_id — a malformed group whose representative_id is out of range
+  // must still surface a valid member, otherwise the coverage pass has
+  // already marked those members as "handled" and the whole group would
+  // vanish silently along with real findings.
+  const candidateIds = [g.representative_id, ...(Array.isArray(g.member_ids) ? g.member_ids : [])];
+  let repId = null;
+  for (const id of candidateIds) {
+    if (Number.isInteger(id) && id >= 0 && id < comments.length && comments[id]) { repId = id; break; }
+  }
+  const rep = repId != null ? comments[repId] : null;
+  const others = Array.isArray(g.member_ids)
+    ? g.member_ids.filter((id) => id !== repId)
+    : [];
+  const line = `[conf ${Number.isFinite(boundedConf) ? boundedConf.toFixed(2) : "?"}] ${(rep?.content || "").match(/\[(P[0-3])\]/)?.[0] || ""} ${rep?.path ?? "?"} :: ${g.root_cause} ${others.length ? "(merged " + others.length + ")" : ""}`;
+  if (surv) {
+    if (!rep) { console.error("skip malformed judge group (no valid rep): " + JSON.stringify(g).slice(0, 120)); continue; }
+    kept.push(rep);
+    console.error("KEEP  " + line);
+  } else { dropped.push(g); console.error("drop  " + line + " — " + (g.reason || "")); }
 }
 
 if (out) fs.writeFileSync(out, JSON.stringify({ ...data, comments: kept }, null, 1));

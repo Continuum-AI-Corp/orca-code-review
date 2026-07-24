@@ -24,8 +24,34 @@ if (!file || !repo || !commit) {
   process.exit(2);
 }
 
-const CODE_EXT = /\.(go|js|jsx|ts|tsx|mjs|cjs|py|java|rb|rs|c|h|cc|cpp|sql|sh)$/i;
+// Only drop findings whose snippet did NOT match anywhere in the tree when
+// the claimed path is a KNOWN non-code file (locale JSON / doc markdown /
+// changelogs / lockfiles / images / binaries). Extensionless code files
+// (Dockerfile, Makefile, scripts with no extension) previously fell through
+// the "not code-ext" branch and got dropped as if they were locale files —
+// reverse the polarity so only clearly-non-code paths incur the drop.
+//
+// Extensions that are ALWAYS non-code (docs, media, binaries, generated).
+const DEFINITELY_NON_CODE_EXT = /\.(md|txt|lock|log|csv|tsv|po|pot|properties|map|png|jpe?g|gif|svg|ico|webp|pdf|woff2?|ttf|eot|otf|zip|tar|gz|tgz|bin|exe|dll|so|dylib|class|jar|wasm|mp3|mp4|mov|wav)$/i;
+// JSON / YAML are ambiguous: action.yml, GitHub workflows, package.json,
+// tsconfig.json, k8s / IaC manifests are all reviewable configuration. Only
+// treat a .json / .yml / .yaml path as non-code when the path itself
+// signals "lockfile", "locale/translation bundle", or "generated build
+// output" — anything else keeps the finding for L2 to judge.
+const CONVENTIONAL_NON_CODE_JSON_YAML_PATH =
+  /(?:(?:^|\/)(?:package-lock|pnpm-lock)\.(?:json|ya?ml))|(?:[-.]lock\.(?:json|ya?ml)$)|(?:(?:^|\/)(?:locales?|i18n|translations|messages|dist|build|generated|out|coverage)\/)/i;
+function isKnownNonCode(p) {
+  if (!p) return false;
+  if (DEFINITELY_NON_CODE_EXT.test(p)) return true;
+  if (!/\.(?:json|ya?ml)$/i.test(p)) return false;
+  return CONVENTIONAL_NON_CODE_JSON_YAML_PATH.test(p);
+}
 
+// Returns a de-duped list of files containing `pattern` at the reviewed
+// commit. Uses `-l` (file-list only) so we sidestep the colon-in-filename
+// ambiguity of `-n`'s "<commit>:<file>:<line>:<text>" format — with `-l`
+// the output is just "<commit>:<file>" and stripping the commit prefix is
+// unambiguous.
 function grepFiles(pattern) {
   if (!pattern || pattern.length < 12) return [];
   try {
@@ -34,9 +60,34 @@ function grepFiles(pattern) {
       maxBuffer: 1 << 24,
     });
     return [...new Set(o.split("\n").filter(Boolean).map((l) => l.slice(l.indexOf(":") + 1)))];
-  } catch {
-    return []; // grep exit 1 = no match
-  }
+  } catch { return []; }
+}
+
+// Returns line numbers where `pattern` matches inside a specific `file` at
+// the commit. We pass `file` as an explicit git pathspec after `--`, so
+// git-grep's output has an exact `<commit>:<file>:` prefix we can strip
+// unambiguously — the colon-in-filename concern from raw `-n` output does
+// not apply here because we already know the file.
+function grepLinesIn(pattern, file) {
+  if (!pattern || pattern.length < 12) return [];
+  try {
+    const o = execFileSync(
+      "git",
+      ["-C", repo, "grep", "-F", "-I", "-n", "-e", pattern, commit, "--", file],
+      { encoding: "utf8", maxBuffer: 1 << 24 },
+    );
+    const prefix = `${commit}:${file}:`;
+    const lines = [];
+    for (const raw of o.split("\n")) {
+      if (!raw || !raw.startsWith(prefix)) continue;
+      const rest = raw.slice(prefix.length);
+      const colon = rest.indexOf(":");
+      if (colon < 0) continue;
+      const n = Number(rest.slice(0, colon));
+      if (Number.isFinite(n)) lines.push(n);
+    }
+    return lines;
+  } catch { return []; }
 }
 
 function candidateLines(code) {
@@ -54,25 +105,66 @@ const report = [];
 const kept = [];
 
 for (const c of comments) {
-  let trueFiles = [];
+  // Try each candidate line from `existing_code` until one has hits.
+  // Remember which candidate matched so we can look up its line numbers
+  // in the rehome target with a second targeted grep.
+  let files = [];
+  let matchedPattern = null;
   for (const ln of candidateLines(c.existing_code)) {
     const f = grepFiles(ln);
-    if (f.length) { trueFiles = f; break; }
+    if (f.length) { files = f; matchedPattern = ln; break; }
   }
   let path = c.path;
+  let start_line = c.start_line;
+  let end_line = c.end_line;
   let action = "keep";
-  if (trueFiles.length) {
-    if (trueFiles.includes(c.path)) action = "keep (correct)";
-    else if (trueFiles.length === 1) { path = trueFiles[0]; action = `REHOME ${c.path} -> ${path}`; }
-    else action = `keep (ambiguous: ${trueFiles.length} files)`;
-  } else if (!CODE_EXT.test(c.path)) {
-    action = "DROP (code snippet, filed on non-code file, not found)";
+  if (files.length) {
+    if (files.includes(c.path)) action = "keep (correct)";
+    else if (files.length === 1) {
+      // Single file elsewhere. Fetch the actual line NUMBERS in that file
+      // to update `start_line`/`end_line` on rehome — but only if the hit
+      // is unambiguous (exactly one line). Multiple hits in the same file
+      // mean the snippet appears more than once, so we cannot pick a
+      // single line to post on — treat as ambiguous and leave the finding
+      // on its original path.
+      const target = files[0];
+      const targetLines = matchedPattern ? grepLinesIn(matchedPattern, target) : [];
+      if (targetLines.length === 1) {
+        path = target;
+        start_line = targetLines[0];
+        end_line = targetLines[0];
+        action = `REHOME ${c.path} -> ${path}:${targetLines[0]}`;
+      } else if (targetLines.length > 1) {
+        // The snippet appears more than once in the target file so we cannot
+        // pick a single line to post on — but L1 has still proven the code
+        // lives in `target`, NOT in `c.path`. Rehome the path (dropping the
+        // now-inapplicable line) rather than leaving the finding on a
+        // known-wrong file just because the line is ambiguous.
+        path = target;
+        start_line = null;
+        end_line = null;
+        action = `REHOME ${c.path} -> ${path} (line ambiguous: ${targetLines.length} hits)`;
+      } else {
+        // Line lookup returned nothing (rare — `-l` said match exists).
+        // Rehome the path but clear the line: the stale line came from the
+        // wrong file (`c.path`) and would either post the comment on an
+        // unrelated line in `target`, or trip GitHub's inline-comment range
+        // validation and reject the whole review.
+        path = target;
+        start_line = null;
+        end_line = null;
+        action = `REHOME ${c.path} -> ${path} (line unresolved)`;
+      }
+    }
+    else action = `keep (ambiguous: ${files.length} files)`;
+  } else if (isKnownNonCode(c.path)) {
+    action = "DROP (code snippet, filed on known-non-code file, not found)";
   } else {
     action = "keep (snippet unverified)";
   }
   report.push({ sev: (c.content || "").match(/\[(P[0-3])\]/)?.[1] || "?", from: c.path, action });
   if (action.startsWith("DROP")) continue;
-  kept.push({ ...c, path });
+  kept.push({ ...c, path, start_line, end_line });
 }
 
 const norm = (s) =>
