@@ -139,6 +139,32 @@ inputs:
       models where per-file review takes longer.
     required: false
     default: "20"
+  precision-filter:
+    description: >-
+      Post-processing between the engine and the merge gate. When `"true"`
+      (default), a deterministic filter (L1) verifies each finding's
+      `existing_code` snippet against the reviewed commit and re-homes or
+      drops findings whose snippet does not match the claimed path; then an
+      LLM judge (L2) clusters findings by root cause and drops
+      low-confidence ones. Set to `"false"` to post the engine's raw
+      findings directly. Both layers are soft-fail — errors keep the prior
+      stage's findings and never abort the review.
+    required: false
+    default: "true"
+  judge-model:
+    description: >-
+      Model used by the L2 judge stage. Should differ from the reviewer
+      model so the judge acts as an independent second opinion. Ignored when
+      `precision-filter` is `"false"`.
+    required: false
+    default: "deepseek/deepseek-v4-pro"
+  judge-threshold:
+    description: >-
+      Keep-threshold for the L2 judge's per-cluster confidence score (0–1).
+      Findings with confidence below this are dropped. Lower to keep more;
+      raise to be stricter.
+    required: false
+    default: "0.5"
 
 runs:
   using: "composite"
@@ -161,7 +187,9 @@ runs:
           "$RUNNER_TEMP/cr-facts.json" "$RUNNER_TEMP/proxy.out" "$RUNNER_TEMP/proxy.err" \
           "$RUNNER_TEMP/policy-block.json" \
           "$RUNNER_TEMP/pr.diff" "$RUNNER_TEMP/diff-guard.json" "$RUNNER_TEMP/prev-summary.md" \
-          "$RUNNER_TEMP/wallclock-timeout"
+          "$RUNNER_TEMP/wallclock-timeout" \
+          "$RUNNER_TEMP/result.l1.json" "$RUNNER_TEMP/result.l2.json" \
+          "$RUNNER_TEMP/result-extra.l1.json" "$RUNNER_TEMP/result-extra.l2.json"
 
     - name: Resolve PR refs
       id: pr
@@ -596,6 +624,13 @@ runs:
         # via GNU `timeout` inside run_pass. Passed as-is (units are minutes;
         # decimals accepted, e.g. "0.5" = 30s). See the input docstring.
         TIMEOUT_MIN: ${{ inputs.timeout-minutes }}
+        # Precision post-processing (L1 postfilter + L2 LLM judge) sits
+        # between `ocr review` and check-result.mjs; toggled by the input.
+        PRECISION_FILTER: ${{ inputs.precision-filter }}
+        POSTFILTER: ${{ github.action_path }}/scripts/postfilter.mjs
+        JUDGE: ${{ github.action_path }}/scripts/judge.mjs
+        JUDGE_MODEL: ${{ inputs.judge-model }}
+        JUDGE_THRESHOLD: ${{ inputs.judge-threshold }}
         # Effective value after the settings/input precedence rule.
         FIX_FIRST: ${{ steps.settings.outputs.fix_first }}
         # Non-empty only when the dashboard supplies a replacement rubric.
@@ -765,6 +800,38 @@ runs:
             printf 'wall-clock timeout after %sm\n' "$TIMEOUT_MIN" > "$RUNNER_TEMP/wallclock-timeout"
           fi
           echo "::endgroup::"
+          # Precision post-processing (seam ③). Only runs when the engine
+          # produced a usable JSON result on this pass — a timeout or crash
+          # leaves nothing to filter, so we skip straight to CHECK which
+          # will fail closed on rc anyway. Both layers write to a temp file
+          # first and only overwrite $1 on success (fail-safe: any
+          # postprocessing error keeps the prior stage's findings, never
+          # aborts the review or corrupts the engine output).
+          if [ "$PRECISION_FILTER" = "true" ] && [ "$rc" = "0" ] && [ -s "$1" ] \
+             && node -e "process.exit((require(process.argv[1]).comments||[]).length>0?0:1)" "$1" 2>/dev/null; then
+            echo "::group::Precision filter — $2"
+            L1_OUT="${1%.json}.l1.json"
+            if node "$POSTFILTER" "$1" "$GITHUB_WORKSPACE" "$HEAD" --out "$L1_OUT" 2>&1 \
+               && [ -s "$L1_OUT" ]; then
+              L1_IN_COUNT=$(node -pe "(require('$1').comments||[]).length")
+              L1_OUT_COUNT=$(node -pe "(require('$L1_OUT').comments||[]).length")
+              echo "L1 postfilter: $L1_IN_COUNT -> $L1_OUT_COUNT"
+              mv "$L1_OUT" "$1"
+            else
+              echo "::warning::L1 postfilter failed — keeping engine findings"
+            fi
+            L2_OUT="${1%.json}.l2.json"
+            if node "$JUDGE" "$1" --model "$JUDGE_MODEL" --threshold "$JUDGE_THRESHOLD" --out "$L2_OUT" 2>&1 \
+               && [ -s "$L2_OUT" ]; then
+              L2_IN_COUNT=$(node -pe "(require('$1').comments||[]).length")
+              L2_OUT_COUNT=$(node -pe "(require('$L2_OUT').comments||[]).length")
+              echo "L2 judge ($JUDGE_MODEL, thr=$JUDGE_THRESHOLD): $L2_IN_COUNT -> $L2_OUT_COUNT"
+              mv "$L2_OUT" "$1"
+            else
+              echo "::warning::L2 judge failed — keeping L1 findings"
+            fi
+            echo "::endgroup::"
+          fi
           node "$CHECK" "$1" "$rc"
         }
 
@@ -1304,4 +1371,6 @@ runs:
           "$RUNNER_TEMP/cr-facts.json" "$RUNNER_TEMP/proxy.out" "$RUNNER_TEMP/proxy.err" \
           "$RUNNER_TEMP/policy-block.json" \
           "$RUNNER_TEMP/pr.diff" "$RUNNER_TEMP/diff-guard.json" "$RUNNER_TEMP/prev-summary.md" \
-          "$RUNNER_TEMP/wallclock-timeout"
+          "$RUNNER_TEMP/wallclock-timeout" \
+          "$RUNNER_TEMP/result.l1.json" "$RUNNER_TEMP/result.l2.json" \
+          "$RUNNER_TEMP/result-extra.l1.json" "$RUNNER_TEMP/result-extra.l2.json"
