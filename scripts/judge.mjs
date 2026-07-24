@@ -22,14 +22,20 @@ let out = null, threshold = 0.7, modelOverride = null;
 for (let i = 0; i < rest.length; i += 1) {
   if (rest[i] === "--out") out = rest[++i];
   else if (rest[i] === "--threshold") {
-    // Validate the numeric range up front so a typo (or an unset env
-    // interpolation resolving to empty string) fails loudly instead of
-    // silently producing NaN, which — via `x >= NaN` = false — would
-    // drop every finding and emit an empty kept set.
+    // Reject anything that isn't a plain decimal in [0,1]. Using parseFloat
+    // would accept a trailing-garbage input ("0.8oops" → 0.8, "0x1" → 0);
+    // Number() is stricter but still allows leading/trailing whitespace
+    // and empty string, so we regex-gate the raw arg first, then coerce.
+    // A silent NaN or an accidentally-clamped value would otherwise drop
+    // every finding via `x >= NaN` = false or shift the gate entirely.
     const rawT = rest[++i];
-    threshold = parseFloat(rawT);
+    if (typeof rawT !== "string" || !/^\s*-?\d+(?:\.\d+)?\s*$/.test(rawT)) {
+      console.error(`judge: --threshold must be a plain decimal, got ${JSON.stringify(rawT)}`);
+      process.exit(2);
+    }
+    threshold = Number(rawT);
     if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
-      console.error(`judge: --threshold must be a number in [0,1], got ${JSON.stringify(rawT)}`);
+      console.error(`judge: --threshold must be in [0,1], got ${JSON.stringify(rawT)}`);
       process.exit(2);
     }
   }
@@ -134,18 +140,26 @@ for (let i = 0; i < findings.length; i += 1) if (!covered.has(i))
 const kept = [];
 const dropped = [];
 for (const g of groups) {
-  const surv = g.keep && Number.isFinite(g.confidence) && g.confidence >= threshold;
-  // Resolve the representative comment through both the primary id and the
-  // first-member fallback, but only push if we actually land on a real
-  // comment — a malformed judge group with an out-of-range id would
-  // otherwise inject `undefined` into the kept set and crash downstream.
-  const memberFallback = Array.isArray(g.member_ids) && g.member_ids.length ? g.member_ids[0] : null;
-  const repId = comments[g.representative_id] != null ? g.representative_id : memberFallback;
+  // Coerce confidence — the judge sometimes serializes it as a JSON string
+  // (e.g. "0.95") on schema drift. Without the coerce, `Number.isFinite("0.95")`
+  // is false and a `keep: true` group would be silently dropped.
+  const conf = Number(g.confidence);
+  const surv = g.keep && Number.isFinite(conf) && conf >= threshold;
+  // Resolve the representative comment by trying the primary id then every
+  // member_id — a malformed group whose representative_id is out of range
+  // must still surface a valid member, otherwise the coverage pass has
+  // already marked those members as "handled" and the whole group would
+  // vanish silently along with real findings.
+  const candidateIds = [g.representative_id, ...(Array.isArray(g.member_ids) ? g.member_ids : [])];
+  let repId = null;
+  for (const id of candidateIds) {
+    if (Number.isInteger(id) && id >= 0 && id < comments.length && comments[id]) { repId = id; break; }
+  }
   const rep = repId != null ? comments[repId] : null;
   const others = Array.isArray(g.member_ids)
     ? g.member_ids.filter((id) => id !== repId)
     : [];
-  const line = `[conf ${g.confidence?.toFixed?.(2) ?? "?"}] ${(rep?.content || "").match(/\[(P[0-3])\]/)?.[0] || ""} ${rep?.path ?? "?"} :: ${g.root_cause} ${others.length ? "(merged " + others.length + ")" : ""}`;
+  const line = `[conf ${Number.isFinite(conf) ? conf.toFixed(2) : "?"}] ${(rep?.content || "").match(/\[(P[0-3])\]/)?.[0] || ""} ${rep?.path ?? "?"} :: ${g.root_cause} ${others.length ? "(merged " + others.length + ")" : ""}`;
   if (surv) {
     if (!rep) { console.error("skip malformed judge group (no valid rep): " + JSON.stringify(g).slice(0, 120)); continue; }
     kept.push(rep);

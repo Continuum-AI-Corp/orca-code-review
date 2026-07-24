@@ -32,35 +32,47 @@ if (!file || !repo || !commit) {
 // so only clearly-non-code paths incur the drop.
 const KNOWN_NON_CODE = /\.(json|ya?ml|md|txt|lock|log|csv|tsv|po|pot|properties)$/i;
 
-// Returns an array of { file, line } — each match of `pattern` at the given
-// commit, with the line NUMBER as reported by git-grep -n so a rehome can
-// point at the actual snippet's line rather than reusing the reviewer's
-// (now-wrong) original line.
+// Returns a de-duped list of files containing `pattern` at the reviewed
+// commit. Uses `-l` (file-list only) so we sidestep the colon-in-filename
+// ambiguity of `-n`'s "<commit>:<file>:<line>:<text>" format — with `-l`
+// the output is just "<commit>:<file>" and stripping the commit prefix is
+// unambiguous.
 function grepFiles(pattern) {
   if (!pattern || pattern.length < 12) return [];
   try {
-    const o = execFileSync("git", ["-C", repo, "grep", "-F", "-I", "-n", "-e", pattern, commit], {
+    const o = execFileSync("git", ["-C", repo, "grep", "-F", "-I", "-l", "-e", pattern, commit], {
       encoding: "utf8",
       maxBuffer: 1 << 24,
     });
-    // Output shape: "<commit>:<file>:<line>:<text>". Strip the commit prefix
-    // once (present because we asked for a specific commit), then parse.
-    const seen = new Map(); // file -> first line seen (dedup multi-hit files)
+    return [...new Set(o.split("\n").filter(Boolean).map((l) => l.slice(l.indexOf(":") + 1)))];
+  } catch { return []; }
+}
+
+// Returns line numbers where `pattern` matches inside a specific `file` at
+// the commit. We pass `file` as an explicit git pathspec after `--`, so
+// git-grep's output has an exact `<commit>:<file>:` prefix we can strip
+// unambiguously — the colon-in-filename concern from raw `-n` output does
+// not apply here because we already know the file.
+function grepLinesIn(pattern, file) {
+  if (!pattern || pattern.length < 12) return [];
+  try {
+    const o = execFileSync(
+      "git",
+      ["-C", repo, "grep", "-F", "-I", "-n", "-e", pattern, commit, "--", file],
+      { encoding: "utf8", maxBuffer: 1 << 24 },
+    );
+    const prefix = `${commit}:${file}:`;
+    const lines = [];
     for (const raw of o.split("\n")) {
-      if (!raw) continue;
-      const afterCommit = raw.slice(raw.indexOf(":") + 1); // "<file>:<line>:<text>"
-      const firstColon = afterCommit.indexOf(":");
-      if (firstColon < 0) continue;
-      const file = afterCommit.slice(0, firstColon);
-      const rest = afterCommit.slice(firstColon + 1);
-      const secondColon = rest.indexOf(":");
-      const line = secondColon >= 0 ? Number(rest.slice(0, secondColon)) : null;
-      if (!seen.has(file)) seen.set(file, Number.isFinite(line) ? line : null);
+      if (!raw || !raw.startsWith(prefix)) continue;
+      const rest = raw.slice(prefix.length);
+      const colon = rest.indexOf(":");
+      if (colon < 0) continue;
+      const n = Number(rest.slice(0, colon));
+      if (Number.isFinite(n)) lines.push(n);
     }
-    return [...seen.entries()].map(([file, line]) => ({ file, line }));
-  } catch {
-    return []; // grep exit 1 = no match
-  }
+    return lines;
+  } catch { return []; }
 }
 
 function candidateLines(code) {
@@ -78,28 +90,45 @@ const report = [];
 const kept = [];
 
 for (const c of comments) {
-  let hits = []; // [{file, line}]
+  // Try each candidate line from `existing_code` until one has hits.
+  // Remember which candidate matched so we can look up its line numbers
+  // in the rehome target with a second targeted grep.
+  let files = [];
+  let matchedPattern = null;
   for (const ln of candidateLines(c.existing_code)) {
     const f = grepFiles(ln);
-    if (f.length) { hits = f; break; }
+    if (f.length) { files = f; matchedPattern = ln; break; }
   }
   let path = c.path;
   let start_line = c.start_line;
   let end_line = c.end_line;
   let action = "keep";
-  const files = hits.map((h) => h.file);
-  if (hits.length) {
+  if (files.length) {
     if (files.includes(c.path)) action = "keep (correct)";
-    else if (hits.length === 1) {
-      // REHOME: the finding is really about `hits[0].file`, not the claimed
-      // path — update BOTH path and lines so the posted comment lands on
-      // the actual snippet, not the reviewer's original (unrelated) line.
-      const hit = hits[0];
-      path = hit.file;
-      if (Number.isFinite(hit.line)) { start_line = hit.line; end_line = hit.line; }
-      action = `REHOME ${c.path} -> ${path}${Number.isFinite(hit.line) ? ":" + hit.line : ""}`;
+    else if (files.length === 1) {
+      // Single file elsewhere. Fetch the actual line NUMBERS in that file
+      // to update `start_line`/`end_line` on rehome — but only if the hit
+      // is unambiguous (exactly one line). Multiple hits in the same file
+      // mean the snippet appears more than once, so we cannot pick a
+      // single line to post on — treat as ambiguous and leave the finding
+      // on its original path.
+      const target = files[0];
+      const targetLines = matchedPattern ? grepLinesIn(matchedPattern, target) : [];
+      if (targetLines.length === 1) {
+        path = target;
+        start_line = targetLines[0];
+        end_line = targetLines[0];
+        action = `REHOME ${c.path} -> ${path}:${targetLines[0]}`;
+      } else if (targetLines.length > 1) {
+        action = `keep (ambiguous: ${targetLines.length} hits in ${target})`;
+      } else {
+        // Line lookup returned nothing (rare — `-l` said match exists).
+        // Fall back to a path-only rehome without changing the line.
+        path = target;
+        action = `REHOME ${c.path} -> ${path} (line unresolved)`;
+      }
     }
-    else action = `keep (ambiguous: ${hits.length} files)`;
+    else action = `keep (ambiguous: ${files.length} files)`;
   } else if (KNOWN_NON_CODE.test(c.path)) {
     action = "DROP (code snippet, filed on known-non-code file, not found)";
   } else {
