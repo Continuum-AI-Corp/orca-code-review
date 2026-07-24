@@ -161,7 +161,16 @@ for (const g of groups) {
         ? parseStrictDecimal(rawConfInput)
         : NaN;
   const boundedConf = Number.isFinite(rawConf) ? Math.min(Math.max(rawConf, 0), 1) : NaN;
-  const surv = g.keep && Number.isFinite(boundedConf) && boundedConf >= threshold;
+  // Coerce `keep` strictly — same schema-drift class as `confidence` above.
+  // Truthy JS treats the STRING `"false"` as true, so a raw `&& g.keep` would
+  // retain a group the judge intended to drop when the LLM stringifies the
+  // boolean. Accept only real `true` or the literal string "true" (case-
+  // insensitive); anything else drops the group as a safe default.
+  const keepInput = g.keep;
+  const groupKeep =
+    keepInput === true ||
+    (typeof keepInput === "string" && keepInput.trim().toLowerCase() === "true");
+  const surv = groupKeep && Number.isFinite(boundedConf) && boundedConf >= threshold;
   // Resolve the representative comment by trying the primary id then every
   // member_id — a malformed group whose representative_id is out of range
   // must still surface a valid member, otherwise the coverage pass has
