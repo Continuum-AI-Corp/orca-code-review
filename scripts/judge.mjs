@@ -97,8 +97,8 @@ const body = JSON.stringify({
   temperature: 0,
   // Scales with the finding count (~250 tokens per cluster JSON entry —
   // member_ids + representative_id + confidence + keep + root_cause + reason —
-  // plus a bit of overhead). 8k tokens truncated the response at 48 findings
-  // (observed on minimax runs on 80bffaa72); 32k gives headroom well past 100.
+  // plus a bit of overhead). 32k gives headroom well past 100 findings; 8k
+  // truncated the response on large batches in earlier testing.
   max_tokens: 32000,
   messages: [{ role: "system", content: system }, { role: "user", content: user }],
 });
