@@ -22,12 +22,9 @@ let out = null, threshold = 0.7, modelOverride = null;
 for (let i = 0; i < rest.length; i += 1) {
   if (rest[i] === "--out") out = rest[++i];
   else if (rest[i] === "--threshold") {
-    // Reject anything that isn't a plain decimal in [0,1]. Using parseFloat
-    // would accept a trailing-garbage input ("0.8oops" → 0.8, "0x1" → 0);
-    // Number() is stricter but still allows leading/trailing whitespace
-    // and empty string, so we regex-gate the raw arg first, then coerce.
-    // A silent NaN or an accidentally-clamped value would otherwise drop
-    // every finding via `x >= NaN` = false or shift the gate entirely.
+    // Regex-gate the raw arg to require a plain decimal, then coerce via
+    // Number(). A silent NaN or accidentally-clamped value would otherwise
+    // drop every finding via `x >= NaN` = false or shift the gate entirely.
     const rawT = rest[++i];
     if (typeof rawT !== "string" || !/^\s*-?\d+(?:\.\d+)?\s*$/.test(rawT)) {
       console.error(`judge: --threshold must be a plain decimal, got ${JSON.stringify(rawT)}`);
@@ -142,8 +139,11 @@ const dropped = [];
 for (const g of groups) {
   // Coerce confidence — the judge sometimes serializes it as a JSON string
   // (e.g. "0.95") on schema drift. Without the coerce, `Number.isFinite("0.95")`
-  // is false and a `keep: true` group would be silently dropped.
-  const conf = Number(g.confidence);
+  // is false and a `keep: true` group would be silently dropped. Clamp
+  // out-of-range values to [0,1] so a stray `2` or coerced boolean cannot
+  // bypass any threshold.
+  const rawConf = Number(g.confidence);
+  const conf = Number.isFinite(rawConf) ? Math.min(Math.max(rawConf, 0), 1) : NaN;
   const surv = g.keep && Number.isFinite(conf) && conf >= threshold;
   // Resolve the representative comment by trying the primary id then every
   // member_id — a malformed group whose representative_id is out of range

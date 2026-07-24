@@ -821,6 +821,12 @@ runs:
               echo "::warning::L1 postfilter failed — keeping engine findings"
             fi
             L2_OUT="${1%.json}.l2.json"
+            # Snapshot whether the engine had already written a policy-block
+            # BEFORE the L2 sidecar call. If the judge then soft-fails through
+            # its own guardrail hit, we must clear ONLY the L2-authored block
+            # and leave any prior engine-authored block intact — the fatal
+            # "Surface guardrail block" branch downstream relies on it.
+            if [ -f "$POLICY_BLOCK" ]; then _pb_pre_l2=1; else _pb_pre_l2=0; fi
             if node "$JUDGE" "$1" --model "$JUDGE_MODEL" --threshold "$JUDGE_THRESHOLD" --out "$L2_OUT" 2>&1 \
                && [ -s "$L2_OUT" ]; then
               L2_IN_COUNT=$(node -pe "(require('$1').comments||[]).length")
@@ -829,13 +835,13 @@ runs:
               mv "$L2_OUT" "$1"
             else
               echo "::warning::L2 judge failed — keeping L1 findings"
-              # If a guardrail/firewall blocked the judge request the proxy
-              # will have written $POLICY_BLOCK — but that block belongs to
-              # the L2 sidecar call, NOT to the engine's own review. Drop
-              # the file so the downstream "Surface guardrail block" step
-              # does not surface a spurious block from a soft-failed judge.
-              rm -f "$POLICY_BLOCK"
+              # Only clear POLICY_BLOCK if the file did NOT exist before the
+              # judge call — otherwise we would erase the engine's own
+              # guardrail record and turn a legitimate block into a silent
+              # pass on the primary review.
+              if [ "$_pb_pre_l2" = "0" ]; then rm -f "$POLICY_BLOCK"; fi
             fi
+            unset _pb_pre_l2
             echo "::endgroup::"
           fi
           node "$CHECK" "$1" "$rc"

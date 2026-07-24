@@ -120,7 +120,15 @@ for (const c of comments) {
         end_line = targetLines[0];
         action = `REHOME ${c.path} -> ${path}:${targetLines[0]}`;
       } else if (targetLines.length > 1) {
-        action = `keep (ambiguous: ${targetLines.length} hits in ${target})`;
+        // The snippet appears more than once in the target file so we cannot
+        // pick a single line to post on — but L1 has still proven the code
+        // lives in `target`, NOT in `c.path`. Rehome the path (dropping the
+        // now-inapplicable line) rather than leaving the finding on a
+        // known-wrong file just because the line is ambiguous.
+        path = target;
+        start_line = null;
+        end_line = null;
+        action = `REHOME ${c.path} -> ${path} (line ambiguous: ${targetLines.length} hits)`;
       } else {
         // Line lookup returned nothing (rare — `-l` said match exists).
         // Fall back to a path-only rehome without changing the line.
