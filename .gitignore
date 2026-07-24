@@ -3,3 +3,11 @@ node_modules/
 .env.*
 *.log
 .DS_Store
+
+# Local research / iteration artifacts. Kept out of the public repo so
+# reviewer transcripts, draft prompts, and week-by-week notes cannot land
+# via an accidental `git add -A`. Anything meant for the repo should live
+# in a tracked, generically-worded file (README, docs/, rules/*.md).
+docs/reports/
+feedbacks/
+rules/*.draft.md
