@@ -17,24 +17,33 @@
 import fs from "node:fs";
 import os from "node:os";
 
+// Parses a strict plain decimal (e.g. "0.7", "-1", "0.5"). Returns the number
+// or NaN. Deliberately does NOT use parseFloat — parseFloat stops at the
+// first non-numeric character so "0.8oops" would silently become 0.8 and
+// "0x1" would become 0. The regex gate rejects any trailing garbage before
+// Number() coerces, so callers can trust the returned value is either a
+// clean decimal or NaN.
+function parseStrictDecimal(raw) {
+  if (typeof raw !== "string" || !/^\s*-?\d+(?:\.\d+)?\s*$/.test(raw)) return NaN;
+  return Number(raw);
+}
+
 const [file, ...rest] = process.argv.slice(2);
 let out = null, threshold = 0.7, modelOverride = null;
 for (let i = 0; i < rest.length; i += 1) {
   if (rest[i] === "--out") out = rest[++i];
   else if (rest[i] === "--threshold") {
-    // Regex-gate the raw arg to require a plain decimal, then coerce via
-    // Number(). A silent NaN or accidentally-clamped value would otherwise
-    // drop every finding via `x >= NaN` = false or shift the gate entirely.
     const rawT = rest[++i];
-    if (typeof rawT !== "string" || !/^\s*-?\d+(?:\.\d+)?\s*$/.test(rawT)) {
+    const parsed = parseStrictDecimal(rawT);
+    if (!Number.isFinite(parsed)) {
       console.error(`judge: --threshold must be a plain decimal, got ${JSON.stringify(rawT)}`);
       process.exit(2);
     }
-    threshold = Number(rawT);
-    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    if (parsed < 0 || parsed > 1) {
       console.error(`judge: --threshold must be in [0,1], got ${JSON.stringify(rawT)}`);
       process.exit(2);
     }
+    threshold = parsed;
   }
   else if (rest[i] === "--model") modelOverride = rest[++i];
 }
@@ -138,13 +147,21 @@ const kept = [];
 const dropped = [];
 for (const g of groups) {
   // Coerce confidence — the judge sometimes serializes it as a JSON string
-  // (e.g. "0.95") on schema drift. Without the coerce, `Number.isFinite("0.95")`
-  // is false and a `keep: true` group would be silently dropped. Clamp
-  // out-of-range values to [0,1] so a stray `2` or coerced boolean cannot
-  // bypass any threshold.
-  const rawConf = Number(g.confidence);
-  const conf = Number.isFinite(rawConf) ? Math.min(Math.max(rawConf, 0), 1) : NaN;
-  const surv = g.keep && Number.isFinite(conf) && conf >= threshold;
+  // (e.g. "0.95") on schema drift. Type-guard first: `Number()` will happily
+  // return 1 for `true` and 0 for `false`/`null`/`[]`, and 1 for `[1]`, any of
+  // which would slip past ANY threshold and bypass the whole gate. Accept
+  // only real numbers or numeric strings; anything else becomes NaN and the
+  // group is dropped as if `keep: false`. `boundedConf` is then clamped so
+  // even a stray `2` from a valid-typed but out-of-range value cannot bypass.
+  const rawConfInput = g.confidence;
+  const rawConf =
+    typeof rawConfInput === "number"
+      ? rawConfInput
+      : typeof rawConfInput === "string"
+        ? parseStrictDecimal(rawConfInput)
+        : NaN;
+  const boundedConf = Number.isFinite(rawConf) ? Math.min(Math.max(rawConf, 0), 1) : NaN;
+  const surv = g.keep && Number.isFinite(boundedConf) && boundedConf >= threshold;
   // Resolve the representative comment by trying the primary id then every
   // member_id — a malformed group whose representative_id is out of range
   // must still surface a valid member, otherwise the coverage pass has
@@ -159,7 +176,7 @@ for (const g of groups) {
   const others = Array.isArray(g.member_ids)
     ? g.member_ids.filter((id) => id !== repId)
     : [];
-  const line = `[conf ${Number.isFinite(conf) ? conf.toFixed(2) : "?"}] ${(rep?.content || "").match(/\[(P[0-3])\]/)?.[0] || ""} ${rep?.path ?? "?"} :: ${g.root_cause} ${others.length ? "(merged " + others.length + ")" : ""}`;
+  const line = `[conf ${Number.isFinite(boundedConf) ? boundedConf.toFixed(2) : "?"}] ${(rep?.content || "").match(/\[(P[0-3])\]/)?.[0] || ""} ${rep?.path ?? "?"} :: ${g.root_cause} ${others.length ? "(merged " + others.length + ")" : ""}`;
   if (surv) {
     if (!rep) { console.error("skip malformed judge group (no valid rep): " + JSON.stringify(g).slice(0, 120)); continue; }
     kept.push(rep);

@@ -30,7 +30,7 @@ if (!file || !repo || !commit) {
 // scripts with no extension) previously fell through the "not code-ext"
 // branch and got dropped as if they were locale files — reverse the polarity
 // so only clearly-non-code paths incur the drop.
-const KNOWN_NON_CODE = /\.(json|ya?ml|md|txt|lock|log|csv|tsv|po|pot|properties)$/i;
+const KNOWN_NON_CODE = /\.(json|ya?ml|md|txt|lock|log|csv|tsv|po|pot|properties|map|png|jpe?g|gif|svg|ico|webp|pdf|woff2?|ttf|eot|otf|zip|tar|gz|tgz|bin|exe|dll|so|dylib|class|jar|wasm|mp3|mp4|mov|wav)$/i;
 
 // Returns a de-duped list of files containing `pattern` at the reviewed
 // commit. Uses `-l` (file-list only) so we sidestep the colon-in-filename
@@ -131,8 +131,13 @@ for (const c of comments) {
         action = `REHOME ${c.path} -> ${path} (line ambiguous: ${targetLines.length} hits)`;
       } else {
         // Line lookup returned nothing (rare — `-l` said match exists).
-        // Fall back to a path-only rehome without changing the line.
+        // Rehome the path but clear the line: the stale line came from the
+        // wrong file (`c.path`) and would either post the comment on an
+        // unrelated line in `target`, or trip GitHub's inline-comment range
+        // validation and reject the whole review.
         path = target;
+        start_line = null;
+        end_line = null;
         action = `REHOME ${c.path} -> ${path} (line unresolved)`;
       }
     }
