@@ -21,7 +21,18 @@ const [file, ...rest] = process.argv.slice(2);
 let out = null, threshold = 0.7, modelOverride = null;
 for (let i = 0; i < rest.length; i += 1) {
   if (rest[i] === "--out") out = rest[++i];
-  else if (rest[i] === "--threshold") threshold = parseFloat(rest[++i]);
+  else if (rest[i] === "--threshold") {
+    // Validate the numeric range up front so a typo (or an unset env
+    // interpolation resolving to empty string) fails loudly instead of
+    // silently producing NaN, which — via `x >= NaN` = false — would
+    // drop every finding and emit an empty kept set.
+    const rawT = rest[++i];
+    threshold = parseFloat(rawT);
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+      console.error(`judge: --threshold must be a number in [0,1], got ${JSON.stringify(rawT)}`);
+      process.exit(2);
+    }
+  }
   else if (rest[i] === "--model") modelOverride = rest[++i];
 }
 if (!file) { console.error("usage: node judge.mjs <filtered.json> [--out f] [--threshold 0.7] [--model deepseek/deepseek-v4-pro]"); process.exit(2); }
@@ -112,18 +123,34 @@ catch (e) { console.error("judge did not return JSON:\n" + content.slice(0, 600)
 const groups = parsed.groups || [];
 const covered = new Set();
 for (const g of groups) for (const id of g.member_ids || []) covered.add(id);
+// Fail-open for findings the judge did not classify into any group: mark
+// them keep with a synthetic confidence that survives ANY user-set
+// threshold, so raising the threshold does not silently drop the judge's
+// blind spots (the previous 0.5 constant fails closed at threshold > 0.5,
+// contradicting the "fail-open" comment).
 for (let i = 0; i < findings.length; i += 1) if (!covered.has(i))
-  groups.push({ member_ids: [i], representative_id: i, confidence: 0.5, keep: true, root_cause: "(uncovered)", reason: "not classified by judge; kept fail-open" });
+  groups.push({ member_ids: [i], representative_id: i, confidence: 1.0, keep: true, root_cause: "(uncovered)", reason: "not classified by judge; kept fail-open above any threshold" });
 
 const kept = [];
 const dropped = [];
 for (const g of groups) {
-  const surv = g.keep && g.confidence >= threshold;
-  const rep = comments[g.representative_id] ?? comments[g.member_ids[0]];
-  const others = (g.member_ids || []).filter((id) => id !== (g.representative_id ?? g.member_ids[0]));
-  const line = `[conf ${g.confidence?.toFixed(2)}] ${(rep?.content || "").match(/\[(P[0-3])\]/)?.[0] || ""} ${rep?.path} :: ${g.root_cause} ${others.length ? "(merged " + others.length + ")" : ""}`;
-  if (surv) { kept.push(rep); console.error("KEEP  " + line); }
-  else { dropped.push(g); console.error("drop  " + line + " — " + (g.reason || "")); }
+  const surv = g.keep && Number.isFinite(g.confidence) && g.confidence >= threshold;
+  // Resolve the representative comment through both the primary id and the
+  // first-member fallback, but only push if we actually land on a real
+  // comment — a malformed judge group with an out-of-range id would
+  // otherwise inject `undefined` into the kept set and crash downstream.
+  const memberFallback = Array.isArray(g.member_ids) && g.member_ids.length ? g.member_ids[0] : null;
+  const repId = comments[g.representative_id] != null ? g.representative_id : memberFallback;
+  const rep = repId != null ? comments[repId] : null;
+  const others = Array.isArray(g.member_ids)
+    ? g.member_ids.filter((id) => id !== repId)
+    : [];
+  const line = `[conf ${g.confidence?.toFixed?.(2) ?? "?"}] ${(rep?.content || "").match(/\[(P[0-3])\]/)?.[0] || ""} ${rep?.path ?? "?"} :: ${g.root_cause} ${others.length ? "(merged " + others.length + ")" : ""}`;
+  if (surv) {
+    if (!rep) { console.error("skip malformed judge group (no valid rep): " + JSON.stringify(g).slice(0, 120)); continue; }
+    kept.push(rep);
+    console.error("KEEP  " + line);
+  } else { dropped.push(g); console.error("drop  " + line + " — " + (g.reason || "")); }
 }
 
 if (out) fs.writeFileSync(out, JSON.stringify({ ...data, comments: kept }, null, 1));

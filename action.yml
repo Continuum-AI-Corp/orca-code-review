@@ -829,6 +829,12 @@ runs:
               mv "$L2_OUT" "$1"
             else
               echo "::warning::L2 judge failed — keeping L1 findings"
+              # If a guardrail/firewall blocked the judge request the proxy
+              # will have written $POLICY_BLOCK — but that block belongs to
+              # the L2 sidecar call, NOT to the engine's own review. Drop
+              # the file so the downstream "Surface guardrail block" step
+              # does not surface a spurious block from a soft-failed judge.
+              rm -f "$POLICY_BLOCK"
             fi
             echo "::endgroup::"
           fi

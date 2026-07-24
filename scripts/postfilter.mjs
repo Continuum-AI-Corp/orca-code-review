@@ -24,16 +24,40 @@ if (!file || !repo || !commit) {
   process.exit(2);
 }
 
-const CODE_EXT = /\.(go|js|jsx|ts|tsx|mjs|cjs|py|java|rb|rs|c|h|cc|cpp|sql|sh)$/i;
+// Only drop findings whose snippet did NOT match anywhere in the tree when
+// the claimed path is a KNOWN non-code file (locale JSON / doc markdown /
+// changelogs / lockfiles). Extensionless code files (Dockerfile, Makefile,
+// scripts with no extension) previously fell through the "not code-ext"
+// branch and got dropped as if they were locale files — reverse the polarity
+// so only clearly-non-code paths incur the drop.
+const KNOWN_NON_CODE = /\.(json|ya?ml|md|txt|lock|log|csv|tsv|po|pot|properties)$/i;
 
+// Returns an array of { file, line } — each match of `pattern` at the given
+// commit, with the line NUMBER as reported by git-grep -n so a rehome can
+// point at the actual snippet's line rather than reusing the reviewer's
+// (now-wrong) original line.
 function grepFiles(pattern) {
   if (!pattern || pattern.length < 12) return [];
   try {
-    const o = execFileSync("git", ["-C", repo, "grep", "-F", "-I", "-l", "-e", pattern, commit], {
+    const o = execFileSync("git", ["-C", repo, "grep", "-F", "-I", "-n", "-e", pattern, commit], {
       encoding: "utf8",
       maxBuffer: 1 << 24,
     });
-    return [...new Set(o.split("\n").filter(Boolean).map((l) => l.slice(l.indexOf(":") + 1)))];
+    // Output shape: "<commit>:<file>:<line>:<text>". Strip the commit prefix
+    // once (present because we asked for a specific commit), then parse.
+    const seen = new Map(); // file -> first line seen (dedup multi-hit files)
+    for (const raw of o.split("\n")) {
+      if (!raw) continue;
+      const afterCommit = raw.slice(raw.indexOf(":") + 1); // "<file>:<line>:<text>"
+      const firstColon = afterCommit.indexOf(":");
+      if (firstColon < 0) continue;
+      const file = afterCommit.slice(0, firstColon);
+      const rest = afterCommit.slice(firstColon + 1);
+      const secondColon = rest.indexOf(":");
+      const line = secondColon >= 0 ? Number(rest.slice(0, secondColon)) : null;
+      if (!seen.has(file)) seen.set(file, Number.isFinite(line) ? line : null);
+    }
+    return [...seen.entries()].map(([file, line]) => ({ file, line }));
   } catch {
     return []; // grep exit 1 = no match
   }
@@ -54,25 +78,36 @@ const report = [];
 const kept = [];
 
 for (const c of comments) {
-  let trueFiles = [];
+  let hits = []; // [{file, line}]
   for (const ln of candidateLines(c.existing_code)) {
     const f = grepFiles(ln);
-    if (f.length) { trueFiles = f; break; }
+    if (f.length) { hits = f; break; }
   }
   let path = c.path;
+  let start_line = c.start_line;
+  let end_line = c.end_line;
   let action = "keep";
-  if (trueFiles.length) {
-    if (trueFiles.includes(c.path)) action = "keep (correct)";
-    else if (trueFiles.length === 1) { path = trueFiles[0]; action = `REHOME ${c.path} -> ${path}`; }
-    else action = `keep (ambiguous: ${trueFiles.length} files)`;
-  } else if (!CODE_EXT.test(c.path)) {
-    action = "DROP (code snippet, filed on non-code file, not found)";
+  const files = hits.map((h) => h.file);
+  if (hits.length) {
+    if (files.includes(c.path)) action = "keep (correct)";
+    else if (hits.length === 1) {
+      // REHOME: the finding is really about `hits[0].file`, not the claimed
+      // path — update BOTH path and lines so the posted comment lands on
+      // the actual snippet, not the reviewer's original (unrelated) line.
+      const hit = hits[0];
+      path = hit.file;
+      if (Number.isFinite(hit.line)) { start_line = hit.line; end_line = hit.line; }
+      action = `REHOME ${c.path} -> ${path}${Number.isFinite(hit.line) ? ":" + hit.line : ""}`;
+    }
+    else action = `keep (ambiguous: ${hits.length} files)`;
+  } else if (KNOWN_NON_CODE.test(c.path)) {
+    action = "DROP (code snippet, filed on known-non-code file, not found)";
   } else {
     action = "keep (snippet unverified)";
   }
   report.push({ sev: (c.content || "").match(/\[(P[0-3])\]/)?.[1] || "?", from: c.path, action });
   if (action.startsWith("DROP")) continue;
-  kept.push({ ...c, path });
+  kept.push({ ...c, path, start_line, end_line });
 }
 
 const norm = (s) =>
